@@ -139,6 +139,14 @@ class TransferBundle:
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
     # Local buffer to check for parameter readiness before transfer
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
+    # EP info of rollout side, since we need to check whether tensors are loaded or not
+    # in weight transferring.
+    rollout_ep_rank: int = 0
+    rollout_ep_size: int = 1
+    # Cached expert ID ranges (calculated once on first use)
+    _cached_start_expert_id: int | None = None
+    _cached_end_expert_id: int | None = None
+    _cached_num_experts: int | None = None
 
     @property
     def params_dict(self):
@@ -163,6 +171,22 @@ class TransferBundle:
 
             # Calculate total expected contributions for this parameter
             if num_experts > 0:
+                # NOTE: for ep, only `num_local_experts` should be loaded
+                # Use cached expert ranges if available, otherwise calculate and cache
+                if self._cached_start_expert_id is None or self._cached_num_experts != num_experts:
+                    start_expert_id = self.rollout_ep_rank * (num_experts // self.rollout_ep_size)
+                    end_expert_id = (self.rollout_ep_rank + 1) * (num_experts // self.rollout_ep_size)
+                    self._cached_start_expert_id = start_expert_id
+                    self._cached_end_expert_id = end_expert_id
+                    self._cached_num_experts = num_experts
+                else:
+                    start_expert_id = self._cached_start_expert_id
+                    end_expert_id = self._cached_end_expert_id
+
+                num_experts = num_experts // self.rollout_ep_size
+                if not (expert >= start_expert_id and expert < end_expert_id):
+                    continue
+
                 # Expert weight: need all experts * shard types
                 # For w13_weight (gate+up): shard is "w1" or "w3", multiplier = 2
                 # For w2_weight (down): shard is "w2", multiplier = 1
@@ -342,9 +366,19 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                         model_replica, self.remote_weight_infos_by_session_id[session_id][0], transfer_engine
                     )
                     self.engines[target.engine_rank] = TransferBundle(
-                        model_replica, transfer_engine, weight_memory_registry, [remote_info]
+                        model_replica,
+                        transfer_engine,
+                        weight_memory_registry,
+                        [remote_info],
+                        rollout_ep_size=parallelism_config.ep_size,
+                        rollout_ep_rank=parallelism_config.ep_rank,
                     )
                 else:
+                    assert (
+                        parallelism_config.ep_size == self.engines[target.engine_rank].rollout_ep_size
+                        and parallelism_config.ep_rank == self.engines[target.engine_rank].rollout_ep_rank
+                    ), "all ep_size/ep_rank of rollout engines should be same"
+                    model_replica = self.engines[target.engine_rank].model_replica
                     self.engines[target.engine_rank].add_remote_session(remote_info)
 
             print_memory("[RDMA] After Local Engine Replicas and engine Creation")
