@@ -1,7 +1,7 @@
 # TODO(jensen): may need to merge this file into the main test file in the future.
 from dataclasses import dataclass
 from typing import Literal
-
+import typer
 import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
