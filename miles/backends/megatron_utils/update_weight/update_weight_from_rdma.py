@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import queue
 import threading
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 
@@ -64,6 +65,7 @@ class ExecutableQueue:
         self._tasks_completed = threading.Event()
         self._active_tasks = 0
         self._lock = threading.Lock()
+        self._active_transferring_engine_batch_ids = {}
 
     def _background_worker(self):
         """Background thread worker that processes queued transfer tasks."""
@@ -76,6 +78,10 @@ class ExecutableQueue:
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id}...")
                     ret = task.engine.batch_transfer_async_write(
                         task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
+                    )
+                    logger.info(f"[RDMA] Executing transfer task for session {task.session_id} done")
+                    self._active_transferring_engine_batch_ids[task.engine] = (
+                        self._active_transferring_engine_batch_ids.get(task.engine, []) + [ret]
                     )
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id} done")
                     if ret < 0:
@@ -114,10 +120,38 @@ class ExecutableQueue:
         if not self._tasks_completed.wait(timeout):
             return False
 
+        ##############may delete the codes##########
+
+        wait_count = 5
+        while wait_count >= 0:
+            for e in self._active_transferring_engine_batch_ids.keys():
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    result = e.get_batch_transfer_status(batch_ids)
+                    if result >= 0:
+                        self._active_transferring_engine_batch_ids[e] = []
+            assert_check_done = True
+            for e in self._active_transferring_engine_batch_ids.keys():
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    assert_check_done = False
+                    break
+            if not assert_check_done:
+                logger.info(f"rdma transferring not done yet, waiting {wait_count}")
+                wait_count -= 1
+                if wait_count <= 0:
+                    raise RuntimeError(f"Batch transfer weights via RDMA failed with error code {result}.")
+                time.sleep(10)
+            else:
+                break
+        ##############may delete the codes##########
+
         # Additionally wait for the queue to be fully processed to avoid race conditions
         # This ensures all tasks have been processed by calling task_done()
         try:
             self._queue.join()  # Wait until all items in the queue have been processed
+            for e in self._active_transferring_engine_batch_ids.keys():
+                self._active_transferring_engine_batch_ids[e] = []
             return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
@@ -237,7 +271,7 @@ class TransferBundle:
                 # Queue the transfer task for async execution
                 task = TransferTask(
                     session_id=session_id,
-                    source_ptrs=source_ptrs.copy(),
+                    source_ptrs=source_ptrs.copy(),  # TODO:copy necessary or not?
                     target_ptrs=target_ptrs.copy(),
                     source_lens=source_lens.copy(),
                     engine=self.engine,
@@ -468,6 +502,11 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         converted_named_tensors.clear()
 
+    def __del__(self):
+        """Cleanup resources when the instance is destroyed."""
+        if hasattr(self, "executable_queue"):
+            self.executable_queue.shutdown()
+
     def finish_transfer_task(self) -> None:
         if not self._is_source:
             return
@@ -480,7 +519,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             # Wait for all queued transfer tasks to complete before cpu offloading
             logging.info("[RDMA] Waiting for all queued transfer tasks to complete...")
             assert self.executable_queue.wait_all_complete(
-                timeout=30.0
+                timeout=300.0  # TODO: here 30 -> 300?
             ), "[RDMA] Some transfer tasks may not have completed within timeout"
 
             # Add CUDA synchronization to ensure all asynchronous RDMA operations are complete
