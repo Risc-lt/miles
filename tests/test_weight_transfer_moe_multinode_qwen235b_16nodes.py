@@ -282,8 +282,10 @@ def execute(args: ScriptArgs):
         num_gpus=num_gpus,
     )
     if args.node_rank > 0 and args.wait_after:
-        time.sleep(3600)
-
+        if args.mode == "nccl":
+            time.sleep(800)
+        else:
+            time.sleep(3600)
 
 @U.dataclass_cli
 def main(args: ScriptArgs):
