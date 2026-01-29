@@ -2,9 +2,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
-import slime.utils.external_utils.command_utils as U
-import typer
-from slime.utils.timer import log_experiment_start
+import miles.utils.external_utils.command_utils as U
+from miles.utils.timer import log_experiment_start
 
 MODEL_NAME = "Qwen3-235B-A22B-Instruct-2507"
 MODEL_TYPE = "qwen3-235B-A22B"
