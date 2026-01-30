@@ -150,8 +150,8 @@ class ExecutableQueue:
         # This ensures all tasks have been processed by calling task_done()
         try:
             self._queue.join()  # Wait until all items in the queue have been processed
-            for e in self._active_transferring_engine_batch_ids.keys():
-                self._active_transferring_engine_batch_ids[e] = []
+            # for e in self._active_transferring_engine_batch_ids.keys():
+            #     self._active_transferring_engine_batch_ids[e] = []
             return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
