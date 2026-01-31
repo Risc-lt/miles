@@ -120,50 +120,54 @@ class ExecutableQueue:
         if not self._tasks_completed.wait(timeout):
             return False
 
-        ##############may delete the codes##########
-
-        wait_count = 5
-        while wait_count >= 0:
-            for e in self._active_transferring_engine_batch_ids.keys():
-                batch_ids = self._active_transferring_engine_batch_ids[e]
-                if len(batch_ids) > 0:
-                    result = e.get_batch_transfer_status(batch_ids)
-                    if result >= 0:
-                        self._active_transferring_engine_batch_ids[e] = []
-            assert_check_done = True
-            for e in self._active_transferring_engine_batch_ids.keys():
-                batch_ids = self._active_transferring_engine_batch_ids[e]
-                if len(batch_ids) > 0:
-                    assert_check_done = False
-                    break
-            if not assert_check_done:
-                logger.info(f"rdma transferring not done yet, waiting {wait_count}")
-                wait_count -= 1
-                if wait_count <= 0:
-                    raise RuntimeError(f"Batch transfer weights via RDMA failed with error code {result}.")
-                time.sleep(10)
-            else:
-                break
-        ##############may delete the codes##########
-
+        # Wait for queue to be fully processed
         try:
             self._queue.join()
-            for e in self._active_transferring_engine_batch_ids.keys():
-                batch_ids = self._active_transferring_engine_batch_ids[e]
-                if len(batch_ids) > 0:
-                    result = e.get_batch_transfer_status(batch_ids)
-                    # result == 0: all freed successfully
-                    # result == -1: timeout/failure, but batch_ids were still freed (lines 583-585)
-                    if result < 0:
-                        logging.warning(f"[RDMA] Batch transfer status check returned {result}")
-
-            # Now safe to clear - batch_ids already freed by getBatchTransferStatus()
-            for e in self._active_transferring_engine_batch_ids.keys():
-                self._active_transferring_engine_batch_ids[e] = []
-            return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
             return False
+
+        # ✅ FIX: Add delay to ensure RDMA tasks are fully finished before freeing batch_ids
+        # This is critical because even though status shows COMPLETED, the is_finished flag
+        # in the C++ layer might not be set yet, causing freeBatchID() to fail silently.
+        logger.info("[RDMA] Adding delay before freeing batch_ids to ensure tasks are fully finished...")
+        time.sleep(1.0)  # Give RDMA layer time to finalize
+
+        # Now free batch_ids with retry logic
+        max_retries = 10
+        retry_delay = 2.0
+
+        for retry in range(max_retries):
+            all_freed = True
+            for e in self._active_transferring_engine_batch_ids.keys():
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    logger.info(f"[RDMA] Attempting to free {len(batch_ids)} batch_ids (attempt {retry + 1}/{max_retries})")
+                    result = e.get_batch_transfer_status(batch_ids)
+                    if result >= 0:
+                        # Successfully freed
+                        self._active_transferring_engine_batch_ids[e] = []
+                        logger.info(f"[RDMA] Successfully freed {len(batch_ids)} batch_ids")
+                    else:
+                        logger.warning(f"[RDMA] get_batch_transfer_status returned {result}, will retry...")
+                        all_freed = False
+
+            if all_freed:
+                logger.info("[RDMA] All batch_ids successfully freed")
+                return True
+
+            # Not all freed yet, wait and retry
+            if retry < max_retries - 1:
+                logger.info(f"[RDMA] Waiting {retry_delay}s before retry...")
+                time.sleep(retry_delay)
+
+        # Failed to free all batch_ids after max retries
+        remaining_count = sum(len(bids) for bids in self._active_transferring_engine_batch_ids.values())
+        logger.error(f"[RDMA] Failed to free {remaining_count} batch_ids after {max_retries} retries!")
+        raise RuntimeError(
+            f"[RDMA] Failed to free {remaining_count} batch_ids after {max_retries} retries. "
+            f"This will cause memory leaks!"
+        )
     def shutdown(self):
         """Shutdown the background worker thread."""
         self._shutdown_event.set()
