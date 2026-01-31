@@ -152,6 +152,14 @@ class ExecutableQueue:
             self._queue.join()  # Wait until all items in the queue have been processed
             # for e in self._active_transferring_engine_batch_ids.keys():
             #     self._active_transferring_engine_batch_ids[e] = []
+            for e in self._active_transferring_engine_batch_ids.keys():
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    e.get_batch_transfer_status(batch_ids)  # Blocks until complete, frees batch_ids
+            
+            # Now safe to clear
+            for e in self._active_transferring_engine_batch_ids.keys():
+                self._active_transferring_engine_batch_ids[e] = []            
             return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
