@@ -83,7 +83,7 @@ class ExecutableQueue:
                     self._active_transferring_engine_batch_ids[task.engine] = (
                         self._active_transferring_engine_batch_ids.get(task.engine, []) + [ret]
                     )
-                    logger.info(f"[RDMA] Executing transfer task for session {task.session_id} done")
+                    logger.info(f"[RDMA] saving batch id {ret} for task {task.session_id} ")
                     if ret < 0:
                         logging.error(f"RDMA transfer failed with error code {ret} for session {task.session_id}")
                 finally:
@@ -146,25 +146,24 @@ class ExecutableQueue:
                 break
         ##############may delete the codes##########
 
-        # Additionally wait for the queue to be fully processed to avoid race conditions
-        # This ensures all tasks have been processed by calling task_done()
         try:
-            self._queue.join()  # Wait until all items in the queue have been processed
-            # for e in self._active_transferring_engine_batch_ids.keys():
-            #     self._active_transferring_engine_batch_ids[e] = []
+            self._queue.join()
             for e in self._active_transferring_engine_batch_ids.keys():
                 batch_ids = self._active_transferring_engine_batch_ids[e]
                 if len(batch_ids) > 0:
-                    e.get_batch_transfer_status(batch_ids)  # Blocks until complete, frees batch_ids
-            
-            # Now safe to clear
+                    result = e.get_batch_transfer_status(batch_ids)
+                    # result == 0: all freed successfully
+                    # result == -1: timeout/failure, but batch_ids were still freed (lines 583-585)
+                    if result < 0:
+                        logging.warning(f"[RDMA] Batch transfer status check returned {result}")
+
+            # Now safe to clear - batch_ids already freed by getBatchTransferStatus()
             for e in self._active_transferring_engine_batch_ids.keys():
-                self._active_transferring_engine_batch_ids[e] = []            
+                self._active_transferring_engine_batch_ids[e] = []
             return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
             return False
-
     def shutdown(self):
         """Shutdown the background worker thread."""
         self._shutdown_event.set()
