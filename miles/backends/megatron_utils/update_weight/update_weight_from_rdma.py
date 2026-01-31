@@ -63,6 +63,8 @@ class ExecutableQueue:
         self._background_thread = None
         self._shutdown_event = threading.Event()
         self._tasks_completed = threading.Event()
+        self._cleanup_requested = threading.Event()
+        self._cleanup_completed = threading.Event()
         self._active_tasks = 0
         self._lock = threading.Lock()
         self._active_transferring_engine_batch_ids = {}
@@ -71,6 +73,15 @@ class ExecutableQueue:
         """Background thread worker that processes queued transfer tasks."""
         while not self._shutdown_event.is_set():
             try:
+                # Check if cleanup is requested
+                if self._cleanup_requested.is_set():
+                    logger.info("[RDMA Worker Thread] Cleanup requested, freeing batch_ids...")
+                    self._perform_cleanup()
+                    self._cleanup_requested.clear()
+                    self._cleanup_completed.set()
+                    logger.info("[RDMA Worker Thread] Cleanup completed")
+                    continue
+
                 # Get task with timeout to allow periodic shutdown checks
                 task = self._queue.get(timeout=0.1)
                 try:
@@ -95,6 +106,35 @@ class ExecutableQueue:
 
             except queue.Empty:
                 continue
+
+    def _perform_cleanup(self):
+        """Cleanup batch_ids in the same thread that allocated them (critical for thread-local cache)."""
+        max_retries = 10
+        retry_delay = 2.0
+
+        for retry in range(max_retries):
+            all_freed = True
+            for e in list(self._active_transferring_engine_batch_ids.keys()):
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    logger.info(f"[RDMA Worker Thread] Attempting to free {len(batch_ids)} batch_ids (attempt {retry + 1}/{max_retries})")
+                    result = e.get_batch_transfer_status(batch_ids)
+                    if result >= 0:
+                        # Successfully freed
+                        self._active_transferring_engine_batch_ids[e] = []
+                        logger.info(f"[RDMA Worker Thread] Successfully freed {len(batch_ids)} batch_ids")
+                    else:
+                        logger.warning(f"[RDMA Worker Thread] get_batch_transfer_status returned {result}, will retry...")
+                        all_freed = False
+
+            if all_freed:
+                logger.info("[RDMA Worker Thread] All batch_ids successfully freed")
+                return
+
+            # Not all freed yet, wait and retry
+            if retry < max_retries - 1:
+                logger.info(f"[RDMA Worker Thread] Waiting {retry_delay}s before retry...")
+                time.sleep(retry_delay)
 
     def start(self):
         """Start the background worker thread."""
@@ -127,47 +167,22 @@ class ExecutableQueue:
             logging.error(f"Error during queue join: {e}")
             return False
 
-        # ✅ FIX: Add delay to ensure RDMA tasks are fully finished before freeing batch_ids
-        # This is critical because even though status shows COMPLETED, the is_finished flag
-        # in the C++ layer might not be set yet, causing freeBatchID() to fail silently.
-        logger.info("[RDMA] Adding delay before freeing batch_ids to ensure tasks are fully finished...")
-        time.sleep(1.0)  # Give RDMA layer time to finalize
+        # ✅ FIX: Request cleanup from the background worker thread
+        # This is CRITICAL because ThreadLocalSliceCache is thread-local!
+        # Slices allocated in the worker thread MUST be freed in the same thread.
+        logger.info("[RDMA] Requesting batch_id cleanup from worker thread...")
+        time.sleep(1.0)  # Give RDMA transfers time to fully complete
 
-        # Now free batch_ids with retry logic
-        max_retries = 10
-        retry_delay = 2.0
+        self._cleanup_completed.clear()
+        self._cleanup_requested.set()
 
-        for retry in range(max_retries):
-            all_freed = True
-            for e in self._active_transferring_engine_batch_ids.keys():
-                batch_ids = self._active_transferring_engine_batch_ids[e]
-                if len(batch_ids) > 0:
-                    logger.info(f"[RDMA] Attempting to free {len(batch_ids)} batch_ids (attempt {retry + 1}/{max_retries})")
-                    result = e.get_batch_transfer_status(batch_ids)
-                    if result >= 0:
-                        # Successfully freed
-                        self._active_transferring_engine_batch_ids[e] = []
-                        logger.info(f"[RDMA] Successfully freed {len(batch_ids)} batch_ids")
-                    else:
-                        logger.warning(f"[RDMA] get_batch_transfer_status returned {result}, will retry...")
-                        all_freed = False
+        # Wait for worker thread to complete cleanup
+        if not self._cleanup_completed.wait(timeout=60.0):
+            logger.error("[RDMA] Cleanup timeout! Worker thread did not respond.")
+            raise RuntimeError("[RDMA] Worker thread failed to complete batch_id cleanup")
 
-            if all_freed:
-                logger.info("[RDMA] All batch_ids successfully freed")
-                return True
-
-            # Not all freed yet, wait and retry
-            if retry < max_retries - 1:
-                logger.info(f"[RDMA] Waiting {retry_delay}s before retry...")
-                time.sleep(retry_delay)
-
-        # Failed to free all batch_ids after max retries
-        remaining_count = sum(len(bids) for bids in self._active_transferring_engine_batch_ids.values())
-        logger.error(f"[RDMA] Failed to free {remaining_count} batch_ids after {max_retries} retries!")
-        raise RuntimeError(
-            f"[RDMA] Failed to free {remaining_count} batch_ids after {max_retries} retries. "
-            f"This will cause memory leaks!"
-        )
+        logger.info("[RDMA] Batch_id cleanup completed successfully")
+        return True
     def shutdown(self):
         """Shutdown the background worker thread."""
         self._shutdown_event.set()
