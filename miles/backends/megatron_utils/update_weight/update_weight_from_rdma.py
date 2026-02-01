@@ -65,6 +65,7 @@ class ExecutableQueue:
         self._tasks_completed = threading.Event()
         self._active_tasks = 0
         self._lock = threading.Lock()
+        self._engine_batch_ids = {}
 
     def _background_worker(self):
         """Background thread worker that processes queued transfer tasks."""
@@ -75,12 +76,14 @@ class ExecutableQueue:
                 try:
                     # Execute the RDMA transfer
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id}...")
-                    ret = task.engine.batch_transfer_async_write(
+                    batch_id = task.engine.batch_transfer_async_write(
                         task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
                     )
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id} done")
-                    if ret < 0:
-                        logging.error(f"RDMA transfer failed with error code {ret} for session {task.session_id}")
+                    with self._lock:
+                        if task.engine not in self._engine_batch_ids:
+                            self._engine_batch_ids[task.engine] = []
+                        self._engine_batch_ids[task.engine].append(batch_id)
                 finally:
                     self._queue.task_done()
                     with self._lock:
@@ -109,7 +112,8 @@ class ExecutableQueue:
     def wait_all_complete(self, timeout=30.0):
         """Wait for all queued tasks to complete before proceeding."""
         if self._active_tasks == 0:
-            return True
+            if len(self._engine_batch_ids) == 0:
+                return True
 
         # Wait for the completion event first
         if not self._tasks_completed.wait(timeout):
@@ -119,10 +123,27 @@ class ExecutableQueue:
         # This ensures all tasks have been processed by calling task_done()
         try:
             self._queue.join()  # Wait until all items in the queue have been processed
-            return True
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
             return False
+        
+        # Sync all batch transfers and unregister memory
+        with self._lock:
+            batch_records = dict(self._engine_batch_ids)
+            self._engine_batch_ids.clear()
+
+        if batch_records:
+            logging.info(f"[RDMA] Syncing batch transfers for {len(batch_records)} engines...")
+            for engine, batch_ids in batch_records.items():
+                if batch_ids:
+                    logging.info(f"[RDMA] Waiting for {len(batch_ids)} batch transfers to complete...")
+                    ret = engine.get_batch_transfer_status(batch_ids)
+                    if ret < 0:
+                        logging.error(f"[RDMA] Batch transfer failed with error code {ret}")
+                        return False
+                    logging.info(f"[RDMA] All {len(batch_ids)} batch transfers completed successfully")
+
+        return True
 
     def shutdown(self):
         """Shutdown the background worker thread."""
@@ -138,6 +159,9 @@ class TransferBundle:
     weight_memory_registry: dict
     remote_weight_infos: list[RemoteWeightInfo]
     param_mapper: ParameterMapper
+    # Registered address after merge (list of (address, size) tuples)
+    registered_blocks: list = dataclasses.field(default_factory=list)
+    _model_on_cpu: bool = False
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
     # Local buffer to check for parameter readiness before transfer
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
@@ -338,18 +362,18 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                     )
                     param_mapper = ParameterMapper.from_model(model_replica)
                     print_memory(f"[RDMA] After model replica at {target.engine_rank}")
-                    weight_memory_registry = self._register_replica_memory(
+                    weight_memory_registry, registered_blocks = self._register_replica_memory(
                         model_replica, self.remote_weight_infos_by_session_id[session_id][0], transfer_engine
                     )
                     self.engines[target.engine_rank] = TransferBundle(
-                        model_replica, transfer_engine, weight_memory_registry, [remote_info], param_mapper
+                        model_replica, transfer_engine, weight_memory_registry, [remote_info], param_mapper, registered_blocks
                     )
                 else:
                     self.engines[target.engine_rank].add_remote_session(remote_info)
 
             print_memory("[RDMA] After Local Engine Replicas and engine Creation")
 
-    def _register_replica_memory(self, model_replica, remote_weight_info, transfer_engine) -> dict:
+    def _register_replica_memory(self, model_replica, remote_weight_info, transfer_engine):
         # Verify the 1-to-1 mapping between local replica and remote weights expected.
         for name, tensor in model_replica.named_parameters():
             if name not in remote_weight_info:
@@ -361,12 +385,23 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 )
             if tensor.device.type != "cuda":
                 raise RuntimeError(f"Local replica parameter {name} is not on CUDA device.")
-        weight_memory_registry = register_memory_region_v2(model_replica, transfer_engine)
+        weight_memory_registry, registered_blocks = register_memory_region_v2(model_replica, transfer_engine)
 
         logger.info(
             f"[RDMA] Registered {len(list(model_replica.named_parameters()))} tensors from replica with transfer engine."
         )
-        return weight_memory_registry
+        return weight_memory_registry, registered_blocks
+    
+    def _unregister_replica_memory(self, registered_blocks, transfer_engine):
+        weight_blocks = []
+        for address, _ in registered_blocks:
+            weight_blocks.append(address)
+
+        transfer_engine.batch_unregister_memory(weight_blocks)
+        logger.info(
+            f"[RDMA] Unregistered tensors from replica with transfer engine."
+        )
+        return
 
     def _create_transfer_engine(self) -> TransferEngine:
         transfer_engine = TransferEngine()
@@ -426,6 +461,16 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         #     self._model_on_cpu = False
 
         for transfer_bundle in self.engines.values():
+            if transfer_bundle._model_on_cpu :
+                # Realloc model replica on GPU since we don't need the last values
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight = weight.storage().resize_(weight.numel())
+                transfer_bundle._model_on_cpu = False
+                transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = self._register_replica_memory(
+                    transfer_bundle.model_replica,
+                    transfer_bundle.remote_weight_infos[0].weights_info,
+                    transfer_bundle.engine,
+                )
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
             if self.pipelined_transfer:
@@ -457,11 +502,17 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 transfer_bundle.reset()
 
         # Offload model replicas from memory after transfer.
-        # TODO(letian): update gpu -> cpu logic here ?
-        # if not self._model_on_cpu:
-        #     print_memory("[RDMA] Before offloading model replica")
-        #     torch_memory_saver.pause(self.tag)
-        #     self._model_on_cpu = True
-        #     print_memory("[RDMA] After offloading model replica")
+        for transfer_bundle in self.engines.values():
+            if not transfer_bundle._model_on_cpu:
+                # Unregister RDMA memory regions before offloading to CPU
+                logger.info("[RDMA] Unregistering memory before offload to CPU...")
+                self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
+        
+                # Release GPU memory
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.storage().resize_(0)
+                transfer_bundle._model_on_cpu = True
+            torch.cuda.empty_cache()
+            print_memory("[RDMA] After offloading model replica")
 
         return
