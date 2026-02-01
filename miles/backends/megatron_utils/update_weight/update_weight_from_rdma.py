@@ -167,7 +167,7 @@ class ExecutableQueue:
         self._cleanup_requested.set()
 
         # Wait for worker thread to complete cleanup
-        if not self._cleanup_completed.wait(timeout=60.0):
+        if not self._cleanup_completed.wait(timeout=300.0):
             logger.error("[RDMA] Cleanup timeout! Worker thread did not respond.")
             raise RuntimeError("[RDMA] Worker thread failed to complete batch_id cleanup")
 
