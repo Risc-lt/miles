@@ -171,7 +171,7 @@ class ExecutableQueue:
         # This is CRITICAL because ThreadLocalSliceCache is thread-local!
         # Slices allocated in the worker thread MUST be freed in the same thread.
         logger.info("[RDMA] Requesting batch_id cleanup from worker thread...")
-        time.sleep(1.0)  # Give RDMA transfers time to fully complete
+        # time.sleep(1.0)  # Give RDMA transfers time to fully complete
 
         self._cleanup_completed.clear()
         self._cleanup_requested.set()
