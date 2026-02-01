@@ -192,10 +192,9 @@ class ExecutableQueue:
 
 @dataclasses.dataclass
 class WeightLoadingTask:
-    """Represents a weight loading + RDMA transfer task."""
-    transfer_bundle: "TransferBundle"
+    """Represents a weight loading + RDMA transfer task for all transfer bundles."""
+    transfer_bundles: dict  # All transfer bundles to process
     converted_named_tensors: list[tuple[str, torch.Tensor]]
-    transfer_ready_params: list[str]
     executable_queue: ExecutableQueue
     clear_callback: callable = None  # Callback to clear the original list after processing
 
@@ -218,11 +217,16 @@ class WeightLoadingQueue:
             try:
                 task = self._queue.get(timeout=0.1)
                 try:
-                    # Load weights into model replica (blocking operation)
-                    task.transfer_bundle.model_replica.load_weights(task.converted_named_tensors)
+                    # Process all transfer bundles
+                    for transfer_bundle in task.transfer_bundles.values():
+                        # Get transfer ready params for this bundle
+                        transfer_ready_params = transfer_bundle.get_transfer_ready_params(task.converted_named_tensors)
 
-                    # Queue RDMA transfer (non-blocking)
-                    task.transfer_bundle.execute_each(task.transfer_ready_params, task.executable_queue)
+                        # Load weights into model replica (blocking operation)
+                        transfer_bundle.model_replica.load_weights(task.converted_named_tensors)
+
+                        # Queue RDMA transfer (non-blocking)
+                        transfer_bundle.execute_each(transfer_ready_params, task.executable_queue)
 
                     # Clear the original list via callback if provided
                     if task.clear_callback is not None:
@@ -599,25 +603,23 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         #     torch_memory_saver.resume(self.tag)
         #     self._model_on_cpu = False
 
-        for transfer_bundle in self.engines.values():
-            transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
-
-            if self.pipelined_transfer:
-                # Queue weight loading task (BLOCKS if queue full - backpressure!)
-                # Pass the list directly without copying - the callback will clear it after processing
-                task = WeightLoadingTask(
-                    transfer_bundle=transfer_bundle,
-                    converted_named_tensors=converted_named_tensors,
-                    transfer_ready_params=transfer_ready_params,
-                    executable_queue=self.executable_queue,
-                    clear_callback=converted_named_tensors.clear,  # Callback to clear after processing
-                )
-                self.weight_loading_queue.enqueue_task(task)  # May block here!
-            else:
-                # Synchronous fallback
+        if self.pipelined_transfer:
+            # Queue weight loading task (BLOCKS if queue full - backpressure!)
+            # Pass all engines and the list directly - the callback will clear it after processing
+            task = WeightLoadingTask(
+                transfer_bundles=self.engines,
+                converted_named_tensors=converted_named_tensors,
+                executable_queue=self.executable_queue,
+                clear_callback=converted_named_tensors.clear,  # Callback to clear after processing
+            )
+            self.weight_loading_queue.enqueue_task(task)  # May block here!
+        else:
+            # Synchronous fallback
+            for transfer_bundle in self.engines.values():
+                transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
                 transfer_bundle.model_replica.load_weights(converted_named_tensors)
                 transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
-                converted_named_tensors.clear()
+            converted_named_tensors.clear()
 
 
     def __del__(self):
