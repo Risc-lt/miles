@@ -153,8 +153,8 @@ class ExecutableQueue:
 
     def wait_all_complete(self, timeout=30.0):
         """Wait for all queued tasks to complete before proceeding."""
-        if self._active_tasks == 0:
-            return True
+        # if self._active_tasks == 0:
+        #     return True
 
         # Wait for the completion event first
         if not self._tasks_completed.wait(timeout):
