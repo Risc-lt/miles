@@ -1,3 +1,5 @@
+import logging
+
 import ray
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -5,6 +7,8 @@ from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.tracking_utils import init_tracking
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -81,12 +85,16 @@ def train(args):
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+            logger.info(f"[TRAIN] Rollout {rollout_id}: Calling save()")
             save(rollout_id)
+            logger.info(f"[TRAIN] Rollout {rollout_id}: save() completed")
 
         offload_train()
         if args.offload_rollout:
             ray.get(rollout_manager.onload_weights.remote())
+        logger.info(f"[TRAIN] Rollout {rollout_id}: Calling actor_model.update_weights()")
         actor_model.update_weights()
+        logger.info(f"[TRAIN] Rollout {rollout_id}: actor_model.update_weights() completed")
         if args.offload_rollout:
             ray.get(rollout_manager.onload_kv.remote())
 

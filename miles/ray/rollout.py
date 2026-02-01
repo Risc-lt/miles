@@ -638,11 +638,17 @@ def _allocate_rollout_engine_addr_and_ports_normal(*, args, num_engines, rollout
         else:
             for i in range(num_engines_on_this_node):
                 addr_and_ports[rank + i]["dist_init_addr"] = f"{get_addr()}:{get_port(30 + args.sglang_dp_size)}"
-
+    # TODO(xinji1): delete these in the future
+    # node_host_addr_str = {}
+    # if nnodes > 1:
+    #     for server_id, node_rank_addr_dict in all_server_node_hosts.items():
+    #         assert len(node_rank_addr_dict) == nnodes, f"server {server_id} missing node address {node_rank_addr_dict}"
+    #         node_host_addr_str[server_id] = json.dumps(node_rank_addr_dict)
+            
     for i, _ in rollout_engines:
-        if nnodes > 1:
-            server_id = i // nnodes
-            addr_and_ports[i]["node_hosts"] = node_host_addr_str[server_id]
+        # if nnodes > 1:
+        #     server_id = i // nnodes
+            # addr_and_ports[i]["node_hosts"] = node_host_addr_str[server_id]
         for key in ["port", "nccl_port", "dist_init_addr"]:
             assert key in addr_and_ports[i], f"Engine {i} {key} is not set."
         logger.info(f"Ports for engine {i}: {addr_and_ports[i]}")

@@ -429,32 +429,66 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only:
             return
 
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logger.info(f"[SAVE] Rank {rank}: Starting save_model at rollout_id {rollout_id}")
+
         # torch dist may trigger nccl communication during saving.
         if self.args.offload_train:
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Reloading process groups")
             reload_process_groups()
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
 
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Finalizing async save (blocking=True)")
             maybe_finalize_async_save(blocking=True)
 
+        if rank == 0:
+            logger.info(f"[SAVE] Rank {rank}: Starting checkpoint save")
         save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        if rank == 0:
+            logger.info(f"[SAVE] Rank {rank}: Checkpoint save completed")
 
         if force_sync and self.args.async_save:
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Force sync - finalizing async save")
             maybe_finalize_async_save(blocking=True)
 
         if self.args.save_hf is not None and self.role == "actor":
             from miles.backends.megatron_utils.model import save_hf_model
 
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Saving HF model")
             save_hf_model(self.args, rollout_id, self.model)
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: HF model saved")
+
+        # Ensure checkpoint validation completes on all ranks before any other operations
+        # (like RDMA weight transfer) can begin. This prevents race conditions where
+        # RDMA operations modify GPU memory while checkpoint validation is reading it.
+        if dist.is_initialized():
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Entering barrier to sync all ranks")
+            dist.barrier()
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: All ranks synced, save_model complete")
 
         if self.args.offload_train:
+            if rank == 0:
+                logger.info(f"[SAVE] Rank {rank}: Destroying process groups")
             destroy_process_groups()
 
     @timer
     def update_weights(self) -> None:
         if self.args.debug_train_only or self.args.debug_rollout_only:
             return
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        if rank == 0:
+            logger.info(f"[UPDATE_WEIGHTS] Rank {rank}: Starting update_weights")
 
         if self.args.use_fault_tolerance:
             if dist.get_rank() == 0:
@@ -466,9 +500,13 @@ class MegatronTrainRayActor(TrainRayActor):
         )
 
         if self.args.offload_train:
+            if rank == 0:
+                logger.info(f"[UPDATE_WEIGHTS] Rank {rank}: Reloading process groups")
             reload_process_groups()
 
         if num_new_engines > 0:
+            if rank == 0:
+                logger.info(f"[UPDATE_WEIGHTS] Rank {rank}: Connecting to {num_new_engines} new rollout engines")
             self.weight_updater.connect_rollout_engines(rollout_engines, rollout_engine_lock)
             dist.barrier(group=get_gloo_group())
             if dist.get_rank() == 0:
@@ -476,7 +514,11 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
+            if rank == 0:
+                logger.info(f"[UPDATE_WEIGHTS] Rank {rank}: Calling weight_updater.update_weights()")
             self.weight_updater.update_weights()
+            if rank == 0:
+                logger.info(f"[UPDATE_WEIGHTS] Rank {rank}: weight_updater.update_weights() completed")
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0:

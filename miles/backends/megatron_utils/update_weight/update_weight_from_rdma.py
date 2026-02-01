@@ -2,6 +2,7 @@ import dataclasses
 import logging
 import queue
 import threading
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 
@@ -62,13 +63,25 @@ class ExecutableQueue:
         self._background_thread = None
         self._shutdown_event = threading.Event()
         self._tasks_completed = threading.Event()
+        self._cleanup_requested = threading.Event()
+        self._cleanup_completed = threading.Event()
         self._active_tasks = 0
         self._lock = threading.Lock()
+        self._active_transferring_engine_batch_ids = {}
 
     def _background_worker(self):
         """Background thread worker that processes queued transfer tasks."""
         while not self._shutdown_event.is_set():
             try:
+                # Check if cleanup is requested
+                if self._cleanup_requested.is_set():
+                    logger.info("[RDMA Worker Thread] Cleanup requested, freeing batch_ids...")
+                    self._perform_cleanup()
+                    self._cleanup_requested.clear()
+                    self._cleanup_completed.set()
+                    logger.info("[RDMA Worker Thread] Cleanup completed")
+                    continue
+
                 # Get task with timeout to allow periodic shutdown checks
                 task = self._queue.get(timeout=0.1)
                 try:
@@ -78,6 +91,10 @@ class ExecutableQueue:
                         task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
                     )
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id} done")
+                    self._active_transferring_engine_batch_ids[task.engine] = (
+                        self._active_transferring_engine_batch_ids.get(task.engine, []) + [ret]
+                    )
+                    logger.info(f"[RDMA] saving batch id {ret} for task {task.session_id} ")
                     if ret < 0:
                         logging.error(f"RDMA transfer failed with error code {ret} for session {task.session_id}")
                 finally:
@@ -89,6 +106,35 @@ class ExecutableQueue:
 
             except queue.Empty:
                 continue
+
+    def _perform_cleanup(self):
+        """Cleanup batch_ids in the same thread that allocated them (critical for thread-local cache)."""
+        max_retries = 10
+        retry_delay = 2.0
+
+        for retry in range(max_retries):
+            all_freed = True
+            for e in list(self._active_transferring_engine_batch_ids.keys()):
+                batch_ids = self._active_transferring_engine_batch_ids[e]
+                if len(batch_ids) > 0:
+                    logger.info(f"[RDMA Worker Thread] Attempting to free {len(batch_ids)} batch_ids (attempt {retry + 1}/{max_retries})")
+                    result = e.get_batch_transfer_status(batch_ids)
+                    if result >= 0:
+                        # Successfully freed
+                        self._active_transferring_engine_batch_ids[e] = []
+                        logger.info(f"[RDMA Worker Thread] Successfully freed {len(batch_ids)} batch_ids")
+                    else:
+                        logger.warning(f"[RDMA Worker Thread] get_batch_transfer_status returned {result}, will retry...")
+                        all_freed = False
+
+            if all_freed:
+                logger.info("[RDMA Worker Thread] All batch_ids successfully freed")
+                return
+
+            # Not all freed yet, wait and retry
+            if retry < max_retries - 1:
+                logger.info(f"[RDMA Worker Thread] Waiting {retry_delay}s before retry...")
+                time.sleep(retry_delay)
 
     def start(self):
         """Start the background worker thread."""
@@ -114,15 +160,29 @@ class ExecutableQueue:
         if not self._tasks_completed.wait(timeout):
             return False
 
-        # Additionally wait for the queue to be fully processed to avoid race conditions
-        # This ensures all tasks have been processed by calling task_done()
+        # Wait for queue to be fully processed
         try:
-            self._queue.join()  # Wait until all items in the queue have been processed
-            return True
+            self._queue.join()
         except Exception as e:
             logging.error(f"Error during queue join: {e}")
             return False
 
+        # ✅ FIX: Request cleanup from the background worker thread
+        # This is CRITICAL because ThreadLocalSliceCache is thread-local!
+        # Slices allocated in the worker thread MUST be freed in the same thread.
+        logger.info("[RDMA] Requesting batch_id cleanup from worker thread...")
+        # time.sleep(1.0)  # Give RDMA transfers time to fully complete
+
+        self._cleanup_completed.clear()
+        self._cleanup_requested.set()
+
+        # Wait for worker thread to complete cleanup
+        if not self._cleanup_completed.wait(timeout=60.0):
+            logger.error("[RDMA] Cleanup timeout! Worker thread did not respond.")
+            raise RuntimeError("[RDMA] Worker thread failed to complete batch_id cleanup")
+
+        logger.info("[RDMA] Batch_id cleanup completed successfully")
+        return True
     def shutdown(self):
         """Shutdown the background worker thread."""
         self._shutdown_event.set()
@@ -139,6 +199,14 @@ class TransferBundle:
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
     # Local buffer to check for parameter readiness before transfer
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
+    # EP info of rollout side, since we need to check whether tensors are loaded or not
+    # in weight transferring.
+    rollout_ep_rank: int = 0
+    rollout_ep_size: int = 1
+    # Cached expert ID ranges (calculated once on first use)
+    _cached_start_expert_id: int | None = None
+    _cached_end_expert_id: int | None = None
+    _cached_num_experts: int | None = None
 
     @property
     def params_dict(self):
@@ -163,6 +231,22 @@ class TransferBundle:
 
             # Calculate total expected contributions for this parameter
             if num_experts > 0:
+                # NOTE: for ep, only `num_local_experts` should be loaded
+                # Use cached expert ranges if available, otherwise calculate and cache
+                if self._cached_start_expert_id is None or self._cached_num_experts != num_experts:
+                    start_expert_id = self.rollout_ep_rank * (num_experts // self.rollout_ep_size)
+                    end_expert_id = (self.rollout_ep_rank + 1) * (num_experts // self.rollout_ep_size)
+                    self._cached_start_expert_id = start_expert_id
+                    self._cached_end_expert_id = end_expert_id
+                    self._cached_num_experts = num_experts
+                else:
+                    start_expert_id = self._cached_start_expert_id
+                    end_expert_id = self._cached_end_expert_id
+
+                num_experts = num_experts // self.rollout_ep_size
+                if not (expert >= start_expert_id and expert < end_expert_id):
+                    continue
+
                 # Expert weight: need all experts * shard types
                 # For w13_weight (gate+up): shard is "w1" or "w3", multiplier = 2
                 # For w2_weight (down): shard is "w2", multiplier = 1
@@ -213,7 +297,7 @@ class TransferBundle:
                 # Queue the transfer task for async execution
                 task = TransferTask(
                     session_id=session_id,
-                    source_ptrs=source_ptrs.copy(),
+                    source_ptrs=source_ptrs.copy(),  # TODO:copy necessary or not?
                     target_ptrs=target_ptrs.copy(),
                     source_lens=source_lens.copy(),
                     engine=self.engine,
@@ -342,9 +426,19 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                         model_replica, self.remote_weight_infos_by_session_id[session_id][0], transfer_engine
                     )
                     self.engines[target.engine_rank] = TransferBundle(
-                        model_replica, transfer_engine, weight_memory_registry, [remote_info]
+                        model_replica,
+                        transfer_engine,
+                        weight_memory_registry,
+                        [remote_info],
+                        rollout_ep_size=parallelism_config.ep_size,
+                        rollout_ep_rank=parallelism_config.ep_rank,
                     )
                 else:
+                    assert (
+                        parallelism_config.ep_size == self.engines[target.engine_rank].rollout_ep_size
+                        and parallelism_config.ep_rank == self.engines[target.engine_rank].rollout_ep_rank
+                    ), "all ep_size/ep_rank of rollout engines should be same"
+                    model_replica = self.engines[target.engine_rank].model_replica
                     self.engines[target.engine_rank].add_remote_session(remote_info)
 
             print_memory("[RDMA] After Local Engine Replicas and engine Creation")
@@ -434,6 +528,11 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         converted_named_tensors.clear()
 
+    def __del__(self):
+        """Cleanup resources when the instance is destroyed."""
+        if hasattr(self, "executable_queue"):
+            self.executable_queue.shutdown()
+
     def finish_transfer_task(self) -> None:
         if not self._is_source:
             return
@@ -446,7 +545,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             # Wait for all queued transfer tasks to complete before cpu offloading
             logging.info("[RDMA] Waiting for all queued transfer tasks to complete...")
             assert self.executable_queue.wait_all_complete(
-                timeout=30.0
+                timeout=300.0  # TODO: here 30 -> 300?
             ), "[RDMA] Some transfer tasks may not have completed within timeout"
 
             # Add CUDA synchronization to ensure all asynchronous RDMA operations are complete
