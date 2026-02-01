@@ -197,6 +197,7 @@ class WeightLoadingTask:
     converted_named_tensors: list[tuple[str, torch.Tensor]]
     transfer_ready_params: list[str]
     executable_queue: ExecutableQueue
+    clear_callback: callable = None  # Callback to clear the original list after processing
 
 
 class WeightLoadingQueue:
@@ -222,6 +223,10 @@ class WeightLoadingQueue:
 
                     # Queue RDMA transfer (non-blocking)
                     task.transfer_bundle.execute_each(task.transfer_ready_params, task.executable_queue)
+
+                    # Clear the original list via callback if provided
+                    if task.clear_callback is not None:
+                        task.clear_callback()
 
                 except Exception as e:
                     logger.error(f"Weight loading failed: {e}")
@@ -599,19 +604,21 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
             if self.pipelined_transfer:
                 # Queue weight loading task (BLOCKS if queue full - backpressure!)
+                # Pass the list directly without copying - the callback will clear it after processing
                 task = WeightLoadingTask(
                     transfer_bundle=transfer_bundle,
-                    converted_named_tensors=converted_named_tensors.copy(),  # Copy to avoid race
+                    converted_named_tensors=converted_named_tensors,
                     transfer_ready_params=transfer_ready_params,
                     executable_queue=self.executable_queue,
+                    clear_callback=converted_named_tensors.clear,  # Callback to clear after processing
                 )
                 self.weight_loading_queue.enqueue_task(task)  # May block here!
             else:
                 # Synchronous fallback
                 transfer_bundle.model_replica.load_weights(converted_named_tensors)
                 transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
+                converted_named_tensors.clear()
 
-        converted_named_tensors.clear()
 
     def __del__(self):
         """Cleanup resources when the instance is destroyed."""
