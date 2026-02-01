@@ -153,8 +153,8 @@ class ExecutableQueue:
 
     def wait_all_complete(self, timeout=30.0):
         """Wait for all queued tasks to complete before proceeding."""
-        if self._active_tasks == 0:
-            return True
+        # if self._active_tasks == 0:
+        #     return True
 
         # Wait for the completion event first
         if not self._tasks_completed.wait(timeout):
@@ -183,6 +183,77 @@ class ExecutableQueue:
 
         logger.info("[RDMA] Batch_id cleanup completed successfully")
         return True
+    def shutdown(self):
+        """Shutdown the background worker thread."""
+        self._shutdown_event.set()
+        if self._background_thread and self._background_thread.is_alive():
+            self._background_thread.join(timeout=5.0)
+
+
+@dataclasses.dataclass
+class WeightLoadingTask:
+    """Represents a weight loading + RDMA transfer task."""
+    transfer_bundle: "TransferBundle"
+    converted_named_tensors: list[tuple[str, torch.Tensor]]
+    transfer_ready_params: list[str]
+    executable_queue: ExecutableQueue
+
+
+class WeightLoadingQueue:
+    """
+    Asynchronous queue for weight loading operations with backpressure.
+    Max queue size: 2 (ensures at most 2 sub-buckets in flight).
+    """
+
+    def __init__(self, max_size: int = 2):
+        self._queue = queue.Queue(maxsize=max_size)  # Bounded queue for backpressure
+        self._background_thread = None
+        self._shutdown_event = threading.Event()
+        self._lock = threading.Lock()
+
+    def _background_worker(self):
+        """Background thread worker that loads weights and triggers RDMA transfers."""
+        while not self._shutdown_event.is_set():
+            try:
+                task = self._queue.get(timeout=0.1)
+                try:
+                    # Load weights into model replica (blocking operation)
+                    task.transfer_bundle.model_replica.load_weights(task.converted_named_tensors)
+
+                    # Queue RDMA transfer (non-blocking)
+                    task.transfer_bundle.execute_each(task.transfer_ready_params, task.executable_queue)
+
+                except Exception as e:
+                    logger.error(f"Weight loading failed: {e}")
+                    raise
+                finally:
+                    self._queue.task_done()
+            except queue.Empty:
+                continue
+
+    def start(self):
+        """Start the background worker thread."""
+        if self._background_thread is None or not self._background_thread.is_alive():
+            self._shutdown_event.clear()
+            self._background_thread = threading.Thread(target=self._background_worker, daemon=True)
+            self._background_thread.start()
+
+    def enqueue_task(self, task: WeightLoadingTask):
+        """
+        Add a weight loading task to the queue.
+        BLOCKS if queue is full (provides backpressure).
+        """
+        self._queue.put(task, block=True)  # Block when full - critical for backpressure!
+
+    def wait_all_complete(self, timeout=60.0):
+        """Wait for all queued tasks to complete."""
+        try:
+            self._queue.join()
+            return True
+        except Exception as e:
+            logger.error(f"Error during queue join: {e}")
+            return False
+
     def shutdown(self):
         """Shutdown the background worker thread."""
         self._shutdown_event.set()
@@ -364,6 +435,10 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         self.executable_queue = ExecutableQueue()
         self.executable_queue.start()
 
+        # Initialize weight loading queue for async weight loading
+        self.weight_loading_queue = WeightLoadingQueue(max_size=2)
+        self.weight_loading_queue.start()
+
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
     ) -> None:
@@ -507,9 +582,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
         """
-        The RDMA P2P weight update is implemented as a single side write, meaning the trainer writes its weights directly to the rollout engines' memory.
-        Now uses an executable queue to make transfer_bundle.execute_each() operations asynchronous,
-        allowing overlap between weight loading and RDMA transfers.
+        The RDMA P2P weight update with async overlapping.
+        Weight loading and RDMA transfers happen in background threads,
+        allowing next bucket's all-gather to overlap.
         """
 
         if not self._is_source or not converted_named_tensors:
@@ -521,15 +596,27 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         for transfer_bundle in self.engines.values():
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
-            transfer_bundle.model_replica.load_weights(converted_named_tensors)
+
             if self.pipelined_transfer:
-                # Use executable queue for async transfer operations
+                # Queue weight loading task (BLOCKS if queue full - backpressure!)
+                task = WeightLoadingTask(
+                    transfer_bundle=transfer_bundle,
+                    converted_named_tensors=converted_named_tensors.copy(),  # Copy to avoid race
+                    transfer_ready_params=transfer_ready_params,
+                    executable_queue=self.executable_queue,
+                )
+                self.weight_loading_queue.enqueue_task(task)  # May block here!
+            else:
+                # Synchronous fallback
+                transfer_bundle.model_replica.load_weights(converted_named_tensors)
                 transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
 
         converted_named_tensors.clear()
 
     def __del__(self):
         """Cleanup resources when the instance is destroyed."""
+        if hasattr(self, "weight_loading_queue"):
+            self.weight_loading_queue.shutdown()
         if hasattr(self, "executable_queue"):
             self.executable_queue.shutdown()
 
@@ -542,16 +629,22 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             for transfer_bundle in self.engines.values():
                 transfer_bundle.execute()
         else:
-            # Wait for all queued transfer tasks to complete before cpu offloading
-            logging.info("[RDMA] Waiting for all queued transfer tasks to complete...")
+            # Wait for all weight loading tasks to complete
+            logger.info("[RDMA] Waiting for all weight loading tasks to complete...")
+            assert self.weight_loading_queue.wait_all_complete(
+                timeout=300.0
+            ), "[RDMA] Weight loading tasks did not complete within timeout"
+
+            # Wait for all queued RDMA transfer tasks to complete
+            logger.info("[RDMA] Waiting for all queued RDMA transfer tasks to complete...")
             assert self.executable_queue.wait_all_complete(
-                timeout=300.0  # TODO: here 30 -> 300?
+                timeout=300.0
             ), "[RDMA] Some transfer tasks may not have completed within timeout"
 
-            # Add CUDA synchronization to ensure all asynchronous RDMA operations are complete
-            # This is critical to prevent race conditions with memory offloading
-            logging.info("[RDMA] Synchronizing CUDA to ensure all asynchronous operations complete...")
+            # CUDA synchronization
+            logger.info("[RDMA] Synchronizing CUDA to ensure all asynchronous operations complete...")
             torch.cuda.synchronize()
+
             for transfer_bundle in self.engines.values():
                 transfer_bundle.reset()
 

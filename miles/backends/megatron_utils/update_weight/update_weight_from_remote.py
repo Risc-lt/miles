@@ -47,6 +47,11 @@ class UpdateWeightFromRemote:
         self.weight_update_mode = weight_update_mode
         self._is_source = self.transfer_plan.is_source()
         self.global_rank = dist.get_rank(group=get_gloo_group())
+
+        # Sub-bucketing configuration for overlapping communication and weight loading
+        self.max_concurrent_sub_bucket = 1 if weight_update_mode != "rdma" else 2
+        self.sub_bucket_size = self.args.update_weight_buffer_size // self.max_concurrent_sub_bucket
+
         self.update_weight_profiler = None
         self.update_weights_wrapped = None
         if getattr(args, "use_pytorch_profiler_update_weight", False):
@@ -185,7 +190,7 @@ class UpdateWeightFromRemote:
             return
 
         param_size = param.numel() * param.element_size()
-        if buffer_size + param_size > self.args.update_weight_buffer_size:
+        if buffer_size + param_size > self.sub_bucket_size:
             self._update_bucket_weights_from_remote(converted_named_tensors, pbar=pbar)
             buffer_size = 0
         converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
@@ -209,7 +214,7 @@ class UpdateWeightFromRemote:
         param_size = param.numel() * param.element_size()
         if (
             buffer_size + param_size
-        ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size and named_tensors:
+        ) * mpu.get_expert_model_parallel_world_size() > self.sub_bucket_size and named_tensors:
             self._update_expert_bucket_weights_from_remote(named_tensors, pbar=pbar)
             buffer_size = 0
 

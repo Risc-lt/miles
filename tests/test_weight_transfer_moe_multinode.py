@@ -41,7 +41,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     node_rank: int = 0
     nnodes: int = 1
     decoder_last_pipeline_num_layers: int | None = None
-
+    bucket_size: float = 0.5
     def validate(self):
         if self.multinode:
             assert self.num_train_gpus % GPUS_PER_NODE == 0, "num_train_gpus must be multiple of GPUS_PER_NODE"
@@ -178,7 +178,11 @@ def execute(args: ScriptArgs):
         sglang_args += "--rdma-pipelined-transfer "
 
     # ci_args = "--ci-test "
-
+    mem = (
+        int(args.bucket_size * 1024 * 1024 * 1024)
+        if args.pipelined_transfer and args.mode == "rdma"
+        else (1 * 1024 * 1024 * 1024)
+    )
     misc_args = (
         # default dropout in megatron is 0.1
         "--attention-dropout 0.0 "
@@ -191,7 +195,7 @@ def execute(args: ScriptArgs):
         "--actor-num-nodes 1 "
         f"--actor-num-gpus-per-node {args.num_train_gpus} "
         # 1GB buffer for weight update
-        f"--update-weight-buffer-size {1 * 1024 ** 3} "
+        f"--update-weight-buffer-size {mem} "
         # enable correctness check
         f"--check-weight-update-equal "
     )
