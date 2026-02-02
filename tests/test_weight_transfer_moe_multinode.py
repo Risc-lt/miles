@@ -236,7 +236,7 @@ def execute(args: ScriptArgs):
         megatron_model_type=MODEL_TYPE,
         train_script="train_async.py",
         extra_env_vars={"RAY_DEBUG": "1",
-                        "MC_TRANSFER_TIMEOUT" : 150
+                        "MC_TRANSFER_TIMEOUT" : "150"
                         
                         },
         multinode=args.multinode,
