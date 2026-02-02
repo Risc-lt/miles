@@ -74,7 +74,7 @@ class ExecutableQueue:
         while not self._shutdown_event.is_set():
             try:
                 # Check if cleanup is requested
-                if self._cleanup_requested.is_set():
+                if self._cleanup_requested.is_set() and self._queue.empty():
                     logger.info("[RDMA Worker Thread] Cleanup requested, freeing batch_ids...")
                     self._perform_cleanup()
                     self._cleanup_requested.clear()
