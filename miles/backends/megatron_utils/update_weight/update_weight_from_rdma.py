@@ -501,18 +501,18 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 transfer_bundle.reset()
 
         # # DISABLED Offload model replicas from memory after transfer.
-        # for transfer_bundle in self.engines.values():
-        #     if not transfer_bundle._offloaded:
-        #         # Unregister RDMA memory regions before offloading to CPU
-        #         logger.info("[RDMA] Unregistering memory before offload to CPU...")
-        #         self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
+        for transfer_bundle in self.engines.values():
+            if not transfer_bundle._offloaded:
+                # Unregister RDMA memory regions before offloading to CPU
+                logger.info("[RDMA] Unregistering memory before offload to CPU...")
+                self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
 
-        #         # Release GPU memory
-        #         for weight in transfer_bundle.model_replica.parameters():
-        #             weight.storage().resize_(0)
-        #         transfer_bundle._offloaded = True
-        #     torch.cuda.empty_cache()
-        #     print_memory("[RDMA] After offloading model replica")
+                # Release GPU memory
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.storage().resize_(0)
+                transfer_bundle._offloaded = True
+            torch.cuda.empty_cache()
+            print_memory("[RDMA] After offloading model replica")
 
         # Reset queue state for next transfer cycle
         if self.pipelined_transfer:
