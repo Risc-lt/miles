@@ -109,32 +109,90 @@ class ExecutableQueue:
 
     def _perform_cleanup(self):
         """Cleanup batch_ids in the same thread that allocated them (critical for thread-local cache)."""
-        max_retries = 10
-        retry_delay = 2.0
+        # Configuration
+        chunk_size = 5  # Process 5 batch_ids at a time (tune this based on performance)
+        max_total_retries = 300  # Total retry budget across all chunks
+        retry_delay = 0.5  # Wait 500ms between retries
 
-        for retry in range(max_retries):
+        retry_count = 0
+
+        while retry_count < max_total_retries:
             all_freed = True
+
             for e in list(self._active_transferring_engine_batch_ids.keys()):
                 batch_ids = self._active_transferring_engine_batch_ids[e]
-                if len(batch_ids) > 0:
-                    logger.info(f"[RDMA Worker Thread] Attempting to free {len(batch_ids)} batch_ids (attempt {retry + 1}/{max_retries})")
-                    result = e.get_batch_transfer_status(batch_ids)
-                    if result >= 0:
-                        # Successfully freed
-                        self._active_transferring_engine_batch_ids[e] = []
-                        logger.info(f"[RDMA Worker Thread] Successfully freed {len(batch_ids)} batch_ids")
-                    else:
-                        logger.warning(f"[RDMA Worker Thread] get_batch_transfer_status returned {result}, will retry...")
+
+                if len(batch_ids) == 0:
+                    continue
+
+                # Process batch_ids in small chunks to avoid overwhelming the C++ busy-wait loop
+                remaining_batch_ids = []
+
+                for chunk_start in range(0, len(batch_ids), chunk_size):
+                    chunk_end = min(chunk_start + chunk_size, len(batch_ids))
+                    chunk = batch_ids[chunk_start:chunk_end]
+
+                    logger.info(
+                        f"[RDMA Worker Thread] Checking batch_ids [{chunk_start}:{chunk_end}] "
+                        f"({len(chunk)} items, retry {retry_count + 1}/{max_total_retries})"
+                    )
+
+                    try:
+                        # Call get_batch_transfer_status with just this small chunk
+                        result = e.get_batch_transfer_status(chunk)
+
+                        if result >= 0:
+                            # Successfully freed this chunk
+                            logger.info(
+                                f"[RDMA Worker Thread] Successfully freed {len(chunk)} batch_ids "
+                                f"from chunk [{chunk_start}:{chunk_end}]"
+                            )
+                        else:
+                            # Failed - keep these batch_ids for retry
+                            logger.warning(
+                                f"[RDMA Worker Thread] Chunk [{chunk_start}:{chunk_end}] returned {result}, "
+                                f"will retry these {len(chunk)} batch_ids"
+                            )
+                            remaining_batch_ids.extend(chunk)
+                            all_freed = False
+
+                    except Exception as ex:
+                        # Exception during status check - keep batch_ids for retry
+                        logger.error(
+                            f"[RDMA Worker Thread] Exception checking chunk [{chunk_start}:{chunk_end}]: {ex}"
+                        )
+                        remaining_batch_ids.extend(chunk)
                         all_freed = False
 
+                # Update with only the batch_ids that still need cleanup
+                self._active_transferring_engine_batch_ids[e] = remaining_batch_ids
+
+                if len(remaining_batch_ids) > 0:
+                    logger.info(
+                        f"[RDMA Worker Thread] {len(remaining_batch_ids)} batch_ids still pending cleanup"
+                    )
+
+            # Check if everything is freed
             if all_freed:
                 logger.info("[RDMA Worker Thread] All batch_ids successfully freed")
                 return
 
-            # Not all freed yet, wait and retry
-            if retry < max_retries - 1:
+            # Increment retry counter and wait before next attempt
+            retry_count += 1
+
+            if retry_count < max_total_retries:
                 logger.info(f"[RDMA Worker Thread] Waiting {retry_delay}s before retry...")
                 time.sleep(retry_delay)
+
+        # Exhausted all retries
+        total_remaining = sum(
+            len(batch_ids)
+            for batch_ids in self._active_transferring_engine_batch_ids.values()
+        )
+        logger.error(
+            f"[RDMA Worker Thread] Cleanup timeout after {max_total_retries} retries! "
+            f"{total_remaining} batch_ids could not be freed"
+        )
 
     def start(self):
         """Start the background worker thread."""
