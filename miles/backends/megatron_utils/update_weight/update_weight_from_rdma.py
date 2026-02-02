@@ -116,6 +116,10 @@ class ExecutableQueue:
 
         retry_count = 0
 
+        # Log initial state
+        total_initial = sum(len(batch_ids) for batch_ids in self._active_transferring_engine_batch_ids.values())
+        logger.info(f"[RDMA Worker Thread] Starting cleanup with {total_initial} total batch_ids across {len(self._active_transferring_engine_batch_ids)} engines")
+
         while retry_count < max_total_retries:
             all_freed = True
 
@@ -128,13 +132,17 @@ class ExecutableQueue:
                 # Process batch_ids in small chunks to avoid overwhelming the C++ busy-wait loop
                 remaining_batch_ids = []
 
+                logger.info(
+                    f"[RDMA Worker Thread] Processing engine with {len(batch_ids)} batch_ids: {batch_ids[:10]}{'...' if len(batch_ids) > 10 else ''}"
+                )
+
                 for chunk_start in range(0, len(batch_ids), chunk_size):
                     chunk_end = min(chunk_start + chunk_size, len(batch_ids))
                     chunk = batch_ids[chunk_start:chunk_end]
 
                     logger.info(
                         f"[RDMA Worker Thread] Checking batch_ids [{chunk_start}:{chunk_end}] "
-                        f"({len(chunk)} items, retry {retry_count + 1}/{max_total_retries})"
+                        f"({len(chunk)} items, retry {retry_count + 1}/{max_total_retries}) - IDs: {chunk}"
                     )
 
                     try:
@@ -145,13 +153,13 @@ class ExecutableQueue:
                             # Successfully freed this chunk
                             logger.info(
                                 f"[RDMA Worker Thread] Successfully freed {len(chunk)} batch_ids "
-                                f"from chunk [{chunk_start}:{chunk_end}]"
+                                f"from chunk [{chunk_start}:{chunk_end}] - IDs: {chunk}"
                             )
                         else:
                             # Failed - keep these batch_ids for retry
                             logger.warning(
                                 f"[RDMA Worker Thread] Chunk [{chunk_start}:{chunk_end}] returned {result}, "
-                                f"will retry these {len(chunk)} batch_ids"
+                                f"will retry these {len(chunk)} batch_ids - IDs: {chunk}"
                             )
                             remaining_batch_ids.extend(chunk)
                             all_freed = False
@@ -159,7 +167,7 @@ class ExecutableQueue:
                     except Exception as ex:
                         # Exception during status check - keep batch_ids for retry
                         logger.error(
-                            f"[RDMA Worker Thread] Exception checking chunk [{chunk_start}:{chunk_end}]: {ex}"
+                            f"[RDMA Worker Thread] Exception checking chunk [{chunk_start}:{chunk_end}]: {ex} - IDs: {chunk}"
                         )
                         remaining_batch_ids.extend(chunk)
                         all_freed = False
@@ -169,7 +177,11 @@ class ExecutableQueue:
 
                 if len(remaining_batch_ids) > 0:
                     logger.info(
-                        f"[RDMA Worker Thread] {len(remaining_batch_ids)} batch_ids still pending cleanup"
+                        f"[RDMA Worker Thread] {len(remaining_batch_ids)} batch_ids still pending cleanup - IDs: {remaining_batch_ids[:10]}{'...' if len(remaining_batch_ids) > 10 else ''}"
+                    )
+                else:
+                    logger.info(
+                        f"[RDMA Worker Thread] All batch_ids for this engine have been freed"
                     )
 
             # Check if everything is freed
