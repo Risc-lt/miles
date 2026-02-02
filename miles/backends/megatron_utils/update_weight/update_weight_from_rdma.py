@@ -118,7 +118,7 @@ class ExecutableQueue:
                 logger.error(f"[RDMA] status error")
                 return
         logger.info("[RDMA] All batch transfers synced successfully")
-        self._active_transferring_engine_batch_ids = []
+        self._active_transferring_engine_batch_ids = {}
 
     def start(self):
         """Start the background worker thread."""
