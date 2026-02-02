@@ -83,7 +83,7 @@ class ExecutableQueue:
                     continue
 
                 # Get task with timeout to allow periodic shutdown checks
-                task = self._queue.get(timeout=0.1)
+                task = self._queue.get(timeout=0.01)
                 try:
                     # Execute the RDMA transfer
                     logger.info(f"[RDMA] Executing transfer task for session {task.session_id}...")
