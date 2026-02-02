@@ -490,7 +490,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             logger.info("[RDMA] Marking enqueue complete and waiting for transfers...")
             self.executable_queue.mark_enqueue_complete()
             assert self.executable_queue.wait_all_complete(
-                timeout=30.0
+                timeout=300.0
             ), "[RDMA] Some transfer tasks may not have completed within timeout"
 
             # Add CUDA synchronization to ensure all asynchronous RDMA operations are complete
