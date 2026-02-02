@@ -48,6 +48,10 @@ def train(args):
             actor_model.clear_memory()
 
     def save(rollout_id):
+        import torch
+
+        torch.cuda.memory._record_memory_history(enabled=True, max_entries=100000)
+
         if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
             actor_model.save_model(
                 rollout_id,
@@ -58,6 +62,9 @@ def train(args):
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
             )
+
+        torch.cuda.memory._dump_snapshot(f"memory_snapshot_rollout_{rollout_id}.pickle")
+        torch.cuda.memory._record_memory_history(enabled=False)
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
 
