@@ -270,7 +270,7 @@ def execute(args: ScriptArgs):
         megatron_model_type=MODEL_TYPE,
         train_script="train.py",
         extra_env_vars={
-            "MC_TRANSFER_TIMEOUT": "60",
+            "MC_TRANSFER_TIMEOUT": "300",
             "RAY_DEBUG": "1",
             "PYTHONPATH": "/root/Megatron-LM/",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
