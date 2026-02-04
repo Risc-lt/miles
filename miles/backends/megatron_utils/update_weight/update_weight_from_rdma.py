@@ -460,7 +460,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             if transfer_bundle._offloaded:
                 # Realloc model replica on GPU since we don't need the last values
                 for weight in transfer_bundle.model_replica.parameters():
-                    weight = weight.storage().resize_(weight.numel())
+                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
                 transfer_bundle._offloaded = False
                 transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
                     self._register_replica_memory(
@@ -472,6 +472,8 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
             if self.pipelined_transfer:
+                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads the source addresses. 
+                torch.cuda.synchronize()
                 # Use executable queue for async transfer operations
                 transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
 
@@ -500,19 +502,20 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             for transfer_bundle in self.engines.values():
                 transfer_bundle.reset()
 
-        # # DISABLED Offload model replicas from memory after transfer.
-        # for transfer_bundle in self.engines.values():
-        #     if not transfer_bundle._offloaded:
-        #         # Unregister RDMA memory regions before offloading to CPU
-        #         logger.info("[RDMA] Unregistering memory before offload to CPU...")
-        #         self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
+        # Offload model replicas from memory after transfer.
+        print_memory("[RDMA] Before offloading model replica")
+        for transfer_bundle in self.engines.values():
+            if not transfer_bundle._offloaded:
+                # Unregister RDMA memory regions before offloading to CPU
+                logger.info("[RDMA] Unregistering memory before offload to CPU...")
+                self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
 
-        #         # Release GPU memory
-        #         for weight in transfer_bundle.model_replica.parameters():
-        #             weight.storage().resize_(0)
-        #         transfer_bundle._offloaded = True
-        #     torch.cuda.empty_cache()
-        #     print_memory("[RDMA] After offloading model replica")
+                # Release GPU memory
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.untyped_storage().resize_(0)
+                transfer_bundle._offloaded = True
+        torch.cuda.empty_cache()
+        print_memory("[RDMA] After offloading model replica")
 
         # Reset queue state for next transfer cycle
         if self.pipelined_transfer:
