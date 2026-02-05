@@ -1,9 +1,9 @@
 import dataclasses
 import logging
-import queue
 import threading
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import ray
 import torch
@@ -21,6 +21,7 @@ from sglang.srt.server_args import ServerArgs
 from tqdm import tqdm
 
 from miles.utils.memory_utils import print_memory
+from miles.utils.timer import timer
 
 from .update_weight_from_remote import UpdateWeightFromRemote
 
@@ -43,122 +44,170 @@ class RemoteWeightInfo:
 
 @dataclasses.dataclass
 class TransferTask:
-    """Represents a queued RDMA transfer task."""
+    """Represents a transfer task for the threadpool."""
 
-    session_id: str
-    source_ptrs: list[int]
-    target_ptrs: list[int]
-    source_lens: list[int]
-    engine: TransferEngine
+    bundle: "TransferBundle"
+    names: list[str]
 
 
-class ExecutableQueue:
+class StreamingTransferManager:
     """
-    Asynchronous queue for executing transfer_bundle.execute_each() operations.
-    Allows overlapping weight loading with RDMA transfer execution.
+    Manages streaming RDMA transfers with parallel registration.
 
-    All TransferEngine calls (batch_transfer_async_write and get_batch_transfer_status)
-    happen on the same background thread to avoid cross-thread cache leaks.
+    - Registration runs in background thread parallel to main thread's all-gather
+    - Transfers stream to threadpool as tensors become ready
+    - Uses blocking sync transfers (simpler, threadpool provides parallelism)
+    - Batch deregistration at end for efficiency
     """
 
-    def __init__(self):
-        self._queue = queue.Queue()
-        self._background_thread = None
-        self._shutdown_event = threading.Event()
-        self._tasks_completed = threading.Event()
-        self._enqueue_complete = threading.Event()
-        self._sync_error_lock = threading.Lock()
-        self._sync_error = None
+    def __init__(self, num_workers: int = 4):
+        self.num_workers = num_workers
+        self.executor: ThreadPoolExecutor | None = None
+        self.registration_complete = threading.Event()
+        self.pending_queue: list[TransferTask] = []
+        self.queue_lock = threading.Lock()
+        self.transfer_futures: list[Future] = []
+        self.reg_thread: threading.Thread | None = None
+        self._bundles: list[TransferBundle] = []
 
-    def _background_worker(self):
-        """Background thread worker that processes queued transfer tasks."""
-        pending_batches: dict[TransferEngine, list[int]] = {}
+    def start_registration(self, bundles: list["TransferBundle"]) -> None:
+        """
+        Start batch registration in background thread - call at start of update cycle.
+        Runs parallel to main thread's all-gather operations.
+        """
+        self._bundles = bundles
+        self.registration_complete.clear()
+        self.pending_queue.clear()
+        self.transfer_futures.clear()
+        self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
-        while not self._shutdown_event.is_set():
-            # Try to get and process a task
+        def do_registration():
             try:
-                task = self._queue.get(timeout=0.1)
-                logger.info(f"[RDMA] Submitting transfer task for session {task.session_id}...")
-                batch_id = task.engine.batch_transfer_async_write(
-                    task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
-                )
-                if task.engine not in pending_batches:
-                    pending_batches[task.engine] = []
-                pending_batches[task.engine].append(batch_id)
-                self._queue.task_done()
-            except queue.Empty:
-                pass
+                with timer("rdma_batch_registration"):
+                    for bundle in bundles:
+                        bundle.weight_memory_registry, bundle.registered_blocks = register_memory_region_v2(
+                            bundle.model_replica, bundle.engine
+                        )
+                        logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors for engine rank")
+            except Exception as e:
+                logger.error(f"[RDMA] Registration failed: {e}")
+                raise
+            finally:
+                with self.queue_lock:
+                    self.registration_complete.set()
+                    for task in self.pending_queue:
+                        future = self.executor.submit(self._do_transfer, task.bundle, task.names)
+                        self.transfer_futures.append(future)
+                    pending_count = len(self.pending_queue)
+                    self.pending_queue.clear()
+                    logger.info(f"[RDMA] Registration complete, drained {pending_count} pending tasks")
 
-            # Check if we should sync (when enqueue complete and queue is drained)
-            if self._enqueue_complete.is_set() and pending_batches and self._queue.empty():
-                self._sync_pending_batches(pending_batches)
-                pending_batches.clear()
-                self._tasks_completed.set()
+        self.reg_thread = threading.Thread(target=do_registration, daemon=True)
+        self.reg_thread.start()
+        logger.info("[RDMA] Started background registration thread")
 
-    def _sync_pending_batches(self, pending_batches: dict[TransferEngine, list[int]]):
-        """Sync all pending batches."""
-        total = sum(len(v) for v in pending_batches.values())
-        logger.info(f"[RDMA] Syncing {total} batch transfers across {len(pending_batches)} engines...")
-        for engine, batch_ids in pending_batches.items():
-            ret = engine.get_batch_transfer_status(batch_ids)
+    def submit_for_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
+        """
+        Called after load_weights + cuda sync for a batch of tensors.
+        Streams to threadpool immediately if registration done, else queues.
+        """
+        if not names:
+            return
+
+        with self.queue_lock:
+            if self.registration_complete.is_set():
+                # Registration done - submit to threadpool immediately
+                future = self.executor.submit(self._do_transfer, bundle, names)
+                self.transfer_futures.append(future)
+            else:
+                # Registration still running - queue for later
+                self.pending_queue.append(TransferTask(bundle=bundle, names=names))
+
+    def _do_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
+        """Blocking transfer - runs in threadpool worker."""
+        # Build source pointers and lengths
+        source_ptrs, source_lens = [], []
+        for name in names:
+            tensor_register = bundle.weight_memory_registry.get(name)
+            if tensor_register is None:
+                logger.warning(f"[RDMA] Parameter {name} not found in weight registry")
+                continue
+            data_ptr, numel, ele_size = tensor_register
+            source_ptrs.append(data_ptr)
+            source_lens.append(numel * ele_size)
+
+        if not source_ptrs:
+            return
+
+        # Transfer to each remote session
+        for remote_session in bundle.remote_weight_infos:
+            session_id = remote_session.session_id
+            remote_weights_info = remote_session.weights_info
+
+            target_ptrs = []
+            for name in names:
+                if name in remote_weights_info:
+                    target_ptrs.append(remote_weights_info[name][0])  # remote address
+
+            if len(target_ptrs) != len(source_ptrs):
+                logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
+                continue
+
+            # Use blocking sync write
+            ret = bundle.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
             if ret < 0:
-                with self._sync_error_lock:
-                    self._sync_error = f"Batch transfer failed with error code {ret}"
-                logger.error(f"[RDMA] {self._sync_error}")
-                return
-        logger.info("[RDMA] All batch transfers synced successfully")
+                logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
-    def start(self):
-        """Start the background worker thread."""
-        if self._background_thread is None or not self._background_thread.is_alive():
-            self._shutdown_event.clear()
-            self._tasks_completed.clear()
-            self._enqueue_complete.clear()
-            self._background_thread = threading.Thread(target=self._background_worker, daemon=True)
-            self._background_thread.start()
+    def wait_and_cleanup(self) -> None:
+        """Wait for all transfers to complete, then batch deregister."""
+        # Ensure registration thread finished
+        if self.reg_thread is not None:
+            self.reg_thread.join(timeout=60.0)
+            if self.reg_thread.is_alive():
+                logger.error("[RDMA] Registration thread did not complete in time")
 
-    def reset(self):
-        """Reset state for next weight transfer task."""
-        with self._sync_error_lock:
-            self._sync_error = None
-        self._enqueue_complete.clear()
-        self._tasks_completed.clear()
+        # Wait for all transfer futures
+        for future in self.transfer_futures:
+            try:
+                future.result(timeout=30.0)
+            except Exception as e:
+                logger.error(f"[RDMA] Transfer future failed: {e}")
 
-    def mark_enqueue_complete(self):
-        """Signal that main thread is done enqueueing tasks."""
-        self._enqueue_complete.set()
+        self.transfer_futures.clear()
 
-    def enqueue_task(self, task: TransferTask):
-        """Add a transfer task to the queue."""
-        self._queue.put(task)
+        # Batch deregister all bundles
+        with timer("rdma_batch_deregistration"):
+            for bundle in self._bundles:
+                if bundle.registered_blocks:
+                    ptrs = [addr for addr, _ in bundle.registered_blocks]
+                    bundle.engine.batch_unregister_memory(ptrs)
+                    logger.info(f"[RDMA] Batch unregistered {len(ptrs)} memory blocks")
+                    bundle.registered_blocks = []
 
-    def wait_all_complete(self, timeout=30.0):
-        """Wait for all queued tasks to complete."""
-        if not self._tasks_completed.wait(timeout):
-            logger.error("[RDMA] Timeout waiting for transfer tasks to complete")
-            return False
-        self._queue.join()
+        # Shutdown executor
+        if self.executor is not None:
+            self.executor.shutdown(wait=False)
+            self.executor = None
 
-        with self._sync_error_lock:
-            if self._sync_error:
-                logger.error(f"[RDMA] Sync error: {self._sync_error}")
-                return False
-        return True
+        # Reset state
+        self.reg_thread = None
+        self._bundles = []
 
-    def shutdown(self):
-        """Shutdown the background worker thread."""
-        self._shutdown_event.set()
-        if self._background_thread and self._background_thread.is_alive():
-            self._background_thread.join(timeout=5.0)
+    def reset(self) -> None:
+        """Reset for next update cycle."""
+        self.registration_complete.clear()
+        self.pending_queue.clear()
+        self.transfer_futures.clear()
 
 
 @dataclasses.dataclass
 class TransferBundle:
     model_replica: Sequence[torch.nn.Module]
     engine: TransferEngine
-    weight_memory_registry: dict
     remote_weight_infos: list[RemoteWeightInfo]
     param_mapper: ParameterMapper
+    # Weight memory registry: name -> (data_ptr, numel, element_size)
+    weight_memory_registry: dict = dataclasses.field(default_factory=dict)
     # Registered address after merge (list of (address, size) tuples)
     registered_blocks: list = dataclasses.field(default_factory=list)
     _offloaded: bool = False
@@ -170,7 +219,6 @@ class TransferBundle:
     def params_dict(self):
         if not self._cached_params_dict:
             self._cached_params_dict = dict(self.model_replica.named_parameters())
-            # logger.info("Full param list: " + str(list(self._cached_params_dict.keys())))
         return self._cached_params_dict
 
     def reset(self):
@@ -180,6 +228,10 @@ class TransferBundle:
         self.remote_weight_infos.append(remote_info)
 
     def get_transfer_ready_params(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> list[str]:
+        """
+        Track which parameters are ready for transfer.
+        A parameter is ready when all its shards have been loaded.
+        """
         transfer_ready_params = []
         for name, _ in converted_named_tensors:
             mapped_result = self.param_mapper.map(name)
@@ -200,7 +252,6 @@ class TransferBundle:
             if total_expected == 1:
                 transfer_ready_params.append(mapped)
             else:
-                # logger.info(f"Sharded param {name} mapped to {mapped} shard {shard}, expert {expert}, expecting {total_expected}")
                 if mapped not in self._update_pending:
                     self._update_pending[mapped] = total_expected - 1
                 else:
@@ -209,45 +260,8 @@ class TransferBundle:
                     transfer_ready_params.append(mapped)
         return transfer_ready_params
 
-    def execute_each(self, names: Sequence[str], executable_queue: ExecutableQueue = None) -> None:
-        """
-        Execute transfer for specific parameter names.
-        If executable_queue is provided, tasks are queued for async execution.
-        Otherwise, falls back to immediate execution for backward compatibility.
-        """
-        # Find local pointers and lengths for the given names
-        source_ptrs, source_lens = [], []
-        for name in names:
-            if name in self._update_pending:
-                assert self._update_pending[name] == 0, f"Parameter {name} is not ready for transfer."
-            tensor_register = self.weight_memory_registry[name]
-            data_ptr, numel, ele_size = tensor_register
-            source_ptrs.append(data_ptr)
-            source_lens.append(numel * ele_size)
-
-        # Match with remote sessions and target pointers
-        for remote_session in self.remote_weight_infos:
-            session_id, remote_weights_info = remote_session.session_id, remote_session.weights_info
-            target_ptrs = []
-            for name in names:
-                target_ptrs.append(remote_weights_info[name][0])  # remote address
-
-            if executable_queue is not None:
-                # Queue the transfer task for async execution
-                task = TransferTask(
-                    session_id=session_id,
-                    source_ptrs=source_ptrs.copy(),
-                    target_ptrs=target_ptrs.copy(),
-                    source_lens=source_lens.copy(),
-                    engine=self.engine,
-                )
-                executable_queue.enqueue_task(task)
-            else:
-                # Immediate execution (backward compatibility)
-                _ = self.engine.batch_transfer_async_write(session_id, source_ptrs, target_ptrs, source_lens)
-
-    def execute(self) -> None:
-        # Execute transfer for each target session using this replica.
+    def execute_all(self) -> None:
+        """Execute transfer for all parameters - used in non-pipelined mode."""
         for remote_session in self.remote_weight_infos:
             session_id, remote_weights_info = remote_session.session_id, remote_session.weights_info
             source_ptrs, target_ptrs, source_lens = [], [], []
@@ -297,9 +311,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         self._offloaded = False
         self.pipelined_transfer = args.rdma_pipelined_transfer
 
-        # Initialize executable queue for async transfer operations
-        self.executable_queue = ExecutableQueue()
-        self.executable_queue.start()
+        # Initialize streaming transfer manager for pipelined transfers
+        num_workers = getattr(args, "rdma_transfer_workers", 4)
+        self.transfer_manager = StreamingTransferManager(num_workers=num_workers)
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -360,16 +374,12 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                     )
                     param_mapper = ParameterMapper.from_model(model_replica)
                     print_memory(f"[RDMA] After model replica at {target.engine_rank}")
-                    weight_memory_registry, registered_blocks = self._register_replica_memory(
-                        model_replica, self.remote_weight_infos_by_session_id[session_id][0], transfer_engine
-                    )
+                    # Note: Registration is deferred to on_transfer_start() for pipelining with all-gather
                     self.engines[target.engine_rank] = TransferBundle(
-                        model_replica,
-                        transfer_engine,
-                        weight_memory_registry,
-                        [remote_info],
-                        param_mapper,
-                        registered_blocks,
+                        model_replica=model_replica,
+                        engine=transfer_engine,
+                        remote_weight_infos=[remote_info],
+                        param_mapper=param_mapper,
                     )
                 else:
                     self.engines[target.engine_rank].add_remote_session(remote_info)
@@ -445,80 +455,113 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         )
         return
 
+    def on_transfer_start(self) -> None:
+        """
+        Hook called at start of weight transfer cycle.
+        Re-onloads model replicas if offloaded and starts background registration.
+        Registration runs parallel to main thread's all-gather operations.
+        """
+        if not self._is_source:
+            return
+
+        bundles_to_register = []
+        for transfer_bundle in self.engines.values():
+            if transfer_bundle._offloaded:
+                # Re-onload model replica - resize storage back to original size
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
+                transfer_bundle._offloaded = False
+                logger.info("[RDMA] Re-onloaded model replica from offloaded state")
+
+            bundles_to_register.append(transfer_bundle)
+
+        if self.pipelined_transfer and bundles_to_register:
+            # Start registration in background thread - runs parallel to all-gather
+            self.transfer_manager.start_registration(bundles_to_register)
+        else:
+            # Non-pipelined: register synchronously
+            for bundle in bundles_to_register:
+                bundle.weight_memory_registry, bundle.registered_blocks = register_memory_region_v2(
+                    bundle.model_replica, bundle.engine
+                )
+                logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors synchronously")
+
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
         """
-        The RDMA P2P weight update is implemented as a single side write, meaning the trainer writes its weights directly to the rollout engines' memory.
-        Now uses an executable queue to make transfer_bundle.execute_each() operations asynchronous,
-        allowing overlap between weight loading and RDMA transfers.
-        """
+        The RDMA P2P weight update is implemented as a single side write,
+        meaning the trainer writes its weights directly to the rollout engines' memory.
 
+        In pipelined mode:
+        - Registration runs in background thread (started by on_transfer_start)
+        - Transfers stream to threadpool as tensors become ready
+        - If registration not done yet, transfers queue and drain when ready
+        """
         if not self._is_source or not converted_named_tensors:
             return
+
         for transfer_bundle in self.engines.values():
-            if transfer_bundle._offloaded:
-                # Realloc model replica on GPU since we don't need the last values
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
-                transfer_bundle._offloaded = False
-                transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
-                    self._register_replica_memory(
-                        transfer_bundle.model_replica,
-                        transfer_bundle.remote_weight_infos[0].weights_info,
-                        transfer_bundle.engine,
-                    )
-                )
+            # Get list of parameters ready for transfer (all shards loaded)
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
+
+            # Load weights into model replica
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
+
             if self.pipelined_transfer:
-                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads the source addresses. 
+                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads
                 torch.cuda.synchronize()
-                # Use executable queue for async transfer operations
-                transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
+                # Submit to streaming transfer manager (queues if registration not done)
+                self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
 
         converted_named_tensors.clear()
 
     def finish_transfer_task(self) -> None:
+        """
+        Complete all pending transfers and clean up.
+
+        In pipelined mode:
+        - Wait for registration thread to complete
+        - Wait for all transfer futures in threadpool
+        - Batch deregister all memory regions
+        - Offload model replicas
+        """
         if not self._is_source:
             return
 
-        # Execute transfer for each engine replica.
         if not self.pipelined_transfer:
+            # Non-pipelined: execute all transfers synchronously
             for transfer_bundle in self.engines.values():
-                transfer_bundle.execute()
+                transfer_bundle.execute_all()
+            # Deregister and offload
+            for transfer_bundle in self.engines.values():
+                if transfer_bundle.registered_blocks:
+                    self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
+                    transfer_bundle.registered_blocks = []
         else:
-            # Wait for all queued transfer tasks to complete before cpu offloading
-            logger.info("[RDMA] Marking enqueue complete and waiting for transfers...")
-            self.executable_queue.mark_enqueue_complete()
-            assert self.executable_queue.wait_all_complete(
-                timeout=30.0
-            ), "[RDMA] Some transfer tasks may not have completed within timeout"
+            # Pipelined: wait for streaming transfers to complete and cleanup
+            logger.info("[RDMA] Waiting for all streaming transfers to complete...")
+            self.transfer_manager.wait_and_cleanup()
+            logger.info("[RDMA] All transfers complete and memory deregistered")
 
-            # Add CUDA synchronization to ensure all asynchronous RDMA operations are complete
-            # This is critical to prevent race conditions with memory offloading
-            logging.info("[RDMA] Synchronizing CUDA to ensure all asynchronous operations complete...")
-            torch.cuda.synchronize()
+            # Reset bundle state for next cycle
             for transfer_bundle in self.engines.values():
                 transfer_bundle.reset()
 
-        # Offload model replicas from memory after transfer.
+        # Offload model replicas from memory after transfer
         print_memory("[RDMA] Before offloading model replica")
         for transfer_bundle in self.engines.values():
             if not transfer_bundle._offloaded:
-                # Unregister RDMA memory regions before offloading to CPU
-                logger.info("[RDMA] Unregistering memory before offload to CPU...")
-                self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
-
                 # Release GPU memory
                 for weight in transfer_bundle.model_replica.parameters():
                     weight.untyped_storage().resize_(0)
                 transfer_bundle._offloaded = True
+
         torch.cuda.empty_cache()
         print_memory("[RDMA] After offloading model replica")
 
-        # Reset queue state for next transfer cycle
+        # Reset transfer manager state for next cycle
         if self.pipelined_transfer:
-            self.executable_queue.reset()
+            self.transfer_manager.reset()
 
         return
