@@ -45,6 +45,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     wait_after: bool = False
     enable_nccl_nvls: bool = False
     bucket_size: float = 1.0
+    released_mc_transfer_timeout: bool = False
 
     def validate(self):
         if self.multinode:
@@ -264,13 +265,15 @@ def execute(args: ScriptArgs):
     if args.node_rank > 0:
         time.sleep(20)
     os.environ["MODEL_ARGS_ROTARY_BASE"] = "5000000"
+    # TODO(xinji1): figure it out if the timeout is the root cause of `Batch transfer failed with error code`
+    mc_transfer_timeout = "300" if args.released_mc_transfer_timeout else "30"
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=num_gpus_per_node,
         megatron_model_type=MODEL_TYPE,
         train_script="train.py",
         extra_env_vars={
-            # "MC_TRANSFER_TIMEOUT": "300",
+            "MC_TRANSFER_TIMEOUT": mc_transfer_timeout,
             "RAY_DEBUG": "1",
             "PYTHONPATH": "/root/Megatron-LM/",
             "CUDA_DEVICE_MAX_CONNECTIONS": "1",
