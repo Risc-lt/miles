@@ -429,27 +429,47 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.debug_rollout_only:
             return
 
+        logger.info(
+            f"[DEBUG save_model] START rollout_id={rollout_id}, force_sync={force_sync}, "
+            f"role={self.role}, offload_train={self.args.offload_train}, "
+            f"async_save={self.args.async_save}, save_hf={self.args.save_hf}"
+        )
+
         # torch dist may trigger nccl communication during saving.
         if self.args.offload_train:
+            logger.info("[DEBUG save_model] reload_process_groups...")
             reload_process_groups()
+            logger.info("[DEBUG save_model] reload_process_groups done")
 
         if self.args.async_save:
             from megatron.training.async_utils import maybe_finalize_async_save
 
+            logger.info("[DEBUG save_model] maybe_finalize_async_save(blocking=True)...")
             maybe_finalize_async_save(blocking=True)
+            logger.info("[DEBUG save_model] maybe_finalize_async_save done")
 
+        logger.info(f"[DEBUG save_model] >>> save(checkpoint) START (rollout_id={rollout_id})")
         save(rollout_id, self.model, self.optimizer, self.opt_param_scheduler)
+        logger.info(f"[DEBUG save_model] <<< save(checkpoint) DONE (rollout_id={rollout_id})")
 
         if force_sync and self.args.async_save:
+            logger.info("[DEBUG save_model] force_sync: maybe_finalize_async_save(blocking=True)...")
             maybe_finalize_async_save(blocking=True)
+            logger.info("[DEBUG save_model] force_sync: maybe_finalize_async_save done")
 
         if self.args.save_hf is not None and self.role == "actor":
             from miles.backends.megatron_utils.model import save_hf_model
 
+            logger.info(f"[DEBUG save_model] >>> save_hf_model START (rollout_id={rollout_id})")
             save_hf_model(self.args, rollout_id, self.model)
+            logger.info(f"[DEBUG save_model] <<< save_hf_model DONE (rollout_id={rollout_id})")
 
         if self.args.offload_train:
+            logger.info("[DEBUG save_model] destroy_process_groups...")
             destroy_process_groups()
+            logger.info("[DEBUG save_model] destroy_process_groups done")
+
+        logger.info(f"[DEBUG save_model] DONE rollout_id={rollout_id}")
 
     @timer
     def update_weights(self) -> None:

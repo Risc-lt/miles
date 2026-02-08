@@ -1,3 +1,6 @@
+import logging
+import traceback
+
 import ray
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -5,6 +8,8 @@ from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.tracking_utils import init_tracking
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -48,18 +53,49 @@ def train(args):
             actor_model.clear_memory()
 
     def save(rollout_id):
-        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
-            actor_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
+        save_actor = (not args.use_critic) or (rollout_id >= args.num_critic_only_steps)
+        logger.info(
+            f"[DEBUG save] rollout_id={rollout_id}, "
+            f"use_critic={args.use_critic}, "
+            f"num_critic_only_steps={getattr(args, 'num_critic_only_steps', None)}, "
+            f"rollout_global_dataset={args.rollout_global_dataset}, "
+            f"save_actor={save_actor}"
+        )
+
+        if save_actor:
+            logger.info(f"[DEBUG save] >>> actor_model.save_model START (rollout_id={rollout_id})")
+            try:
+                actor_model.save_model(
+                    rollout_id,
+                    force_sync=rollout_id == args.num_rollout - 1,
+                )
+                logger.info(f"[DEBUG save] <<< actor_model.save_model DONE (rollout_id={rollout_id})")
+            except Exception as e:
+                logger.error(f"[DEBUG save] !!! actor_model.save_model FAILED: {e}\n{traceback.format_exc()}")
+                raise
+
         if args.use_critic:
-            critic_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
+            logger.info(f"[DEBUG save] >>> critic_model.save_model START (rollout_id={rollout_id})")
+            try:
+                critic_model.save_model(
+                    rollout_id,
+                    force_sync=rollout_id == args.num_rollout - 1,
+                )
+                logger.info(f"[DEBUG save] <<< critic_model.save_model DONE (rollout_id={rollout_id})")
+            except Exception as e:
+                logger.error(f"[DEBUG save] !!! critic_model.save_model FAILED: {e}\n{traceback.format_exc()}")
+                raise
+
         if args.rollout_global_dataset:
-            ray.get(rollout_manager.save.remote(rollout_id))
+            logger.info(f"[DEBUG save] >>> rollout_manager.save START (rollout_id={rollout_id})")
+            try:
+                ray.get(rollout_manager.save.remote(rollout_id))
+                logger.info(f"[DEBUG save] <<< rollout_manager.save DONE (rollout_id={rollout_id})")
+            except Exception as e:
+                logger.error(f"[DEBUG save] !!! rollout_manager.save FAILED: {e}\n{traceback.format_exc()}")
+                raise
+
+        logger.info(f"[DEBUG save] save() completed for rollout_id={rollout_id}")
 
     # train loop.
     # note that for async training, one can change the position of the sync operation(ray.get).
@@ -80,8 +116,8 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
-        # if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-        #     save(rollout_id)
+        if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
+            save(rollout_id)
 
         offload_train()
         if args.offload_rollout:
