@@ -769,120 +769,160 @@ def save(
         if not async_sharded_save:
             logger.info("[DEBUG dist_ckpt.save] step 4/5: sharded_strategy.save (synchronous) - EXPANDED")
 
-            # -- 4a: async_save (planning phase) --
-            # Instead of calling sharded_strategy.save() which internally calls
-            # async_save() + execute_sync(), we break it apart for logging.
-            from megatron.core.dist_checkpointing.strategies.torch import (
-                _replace_state_dict_keys_with_sharded_keys,
-                mcore_to_pyt_state_dict,
-            )
-            from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
-                save_state_dict_async_plan,
-            )
-            from megatron.core.dist_checkpointing.strategies.torch import (
-                MCoreSavePlanner,
-                MultiStorageClientFeature,
-                FileSystemWriterAsync,
+            # The sharded_strategy may be a FullyParallelSaveStrategyWrapper which wraps a
+            # TorchDistSaveShardedStrategy as base_strategy. We instrument at the right level.
+            from megatron.core.dist_checkpointing.strategies.fully_parallel import (
+                FullyParallelSaveStrategyWrapper,
             )
 
-            logger.info("[DEBUG dist_ckpt.save] step 4a: _replace_state_dict_keys_with_sharded_keys START")
-            (sd_transformed, flat_mapping, rename_mapping) = (
-                _replace_state_dict_keys_with_sharded_keys(
-                    sharded_state_dict, sharded_strategy.keep_only_main_replica
+            # Determine the actual TorchDistSaveShardedStrategy
+            if isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper):
+                inner_strategy = sharded_strategy.base_strategy
+                logger.info(f"[DEBUG dist_ckpt.save] strategy is FullyParallelSaveStrategyWrapper, inner={type(inner_strategy).__name__}")
+            else:
+                inner_strategy = sharded_strategy
+                logger.info(f"[DEBUG dist_ckpt.save] strategy is {type(inner_strategy).__name__} (no wrapper)")
+
+            # Monkey-patch inner_strategy.async_save to log sub-steps
+            _orig_inner_async_save = inner_strategy.async_save
+
+            def _debug_inner_async_save(sd, ckpt_dir):
+                from megatron.core.dist_checkpointing.strategies.torch import (
+                    _replace_state_dict_keys_with_sharded_keys,
+                    mcore_to_pyt_state_dict,
                 )
-            )
-            logger.info("[DEBUG dist_ckpt.save] step 4a: _replace_state_dict_keys_with_sharded_keys DONE")
-
-            logger.info("[DEBUG dist_ckpt.save] step 4b: mcore_to_pyt_state_dict START")
-            pyt_state_dict = mcore_to_pyt_state_dict(sd_transformed, False)
-            logger.info(f"[DEBUG dist_ckpt.save] step 4b: mcore_to_pyt_state_dict DONE (keys={len(pyt_state_dict)})")
-
-            logger.info("[DEBUG dist_ckpt.save] step 4c: FileSystemWriterAsync + save_state_dict_async_plan START")
-            writer = FileSystemWriterAsync(
-                checkpoint_dir,
-                separation_hint=sharded_strategy.separation_hint,
-                thread_count=sharded_strategy.thread_count,
-                use_msc=MultiStorageClientFeature.is_enabled(),
-            )
-            coordinator = 0
-            args_cached_plans = None
-            loaded_all_plans = None
-            if sharded_strategy.use_cached_ckpt_structure:
-                loaded_all_plans = getattr(sharded_strategy.cached_global_metadata, "all_local_plans", None)
-                args_cached_plans = (
-                    sharded_strategy.cached_central_plan,
-                    sharded_strategy.cached_local_plan,
-                    sharded_strategy.validated_cache_reuse,
+                from megatron.core.dist_checkpointing.strategies.state_dict_saver import (
+                    save_state_dict_async_plan,
+                )
+                from megatron.core.dist_checkpointing.strategies.torch import (
+                    MCoreSavePlanner,
+                    MultiStorageClientFeature,
+                    FileSystemWriterAsync,
                 )
 
-            (
-                save_state_dict_ret,
-                sharded_strategy.cached_central_plan,
-                sharded_strategy.cached_local_plan,
-                sharded_strategy.validated_cache_reuse,
-                sharded_strategy.validated_loaded_metadata_reuse,
-            ) = save_state_dict_async_plan(
-                pyt_state_dict,
-                writer,
-                None,
-                coordinator,
-                planner=MCoreSavePlanner(
-                    dedup_replicated_tensors=not sharded_strategy.keep_only_main_replica,
-                    flatten_state_dict=False,
-                ),
-                cached_ckpt_structure=args_cached_plans,
-                loaded_all_plans=loaded_all_plans,
-            )
-            logger.info("[DEBUG dist_ckpt.save] step 4c: save_state_dict_async_plan DONE")
+                logger.info("[DEBUG dist_ckpt.save] step 4a: _replace_state_dict_keys_with_sharded_keys START")
+                (sd_transformed, flat_mapping, rename_mapping) = (
+                    _replace_state_dict_keys_with_sharded_keys(
+                        sd, inner_strategy.keep_only_main_replica
+                    )
+                )
+                logger.info("[DEBUG dist_ckpt.save] step 4a: _replace_state_dict_keys_with_sharded_keys DONE")
 
-            # Handle cached metadata reuse (same as async_save logic)
-            rank = torch.distributed.get_rank()
-            if sharded_strategy.use_cached_ckpt_structure:
-                if (
-                    loaded_all_plans
-                    and sharded_strategy.cached_global_metadata
-                    and sharded_strategy.validated_loaded_metadata_reuse
-                ):
-                    if coordinator == rank:
-                        save_state_dict_ret = list(save_state_dict_ret)
-                        save_state_dict_ret[1] = sharded_strategy.cached_global_metadata
-                elif sharded_strategy.validated_cache_reuse:
-                    if save_state_dict_ret[1]:
-                        sharded_strategy.cached_global_metadata = save_state_dict_ret[1]
-                    elif coordinator == rank:
-                        save_state_dict_ret = list(save_state_dict_ret)
-                        save_state_dict_ret[1] = sharded_strategy.cached_global_metadata
+                logger.info("[DEBUG dist_ckpt.save] step 4b: mcore_to_pyt_state_dict START")
+                pyt_state_dict = mcore_to_pyt_state_dict(sd_transformed, False)
+                logger.info(f"[DEBUG dist_ckpt.save] step 4b: mcore_to_pyt_state_dict DONE (keys={len(pyt_state_dict)})")
 
-            # -- 4d: Build AsyncRequest (same as _get_save_and_finalize_callbacks) --
-            logger.info("[DEBUG dist_ckpt.save] step 4d: _get_save_and_finalize_callbacks START")
-            async_request = sharded_strategy._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
-            logger.info("[DEBUG dist_ckpt.save] step 4d: _get_save_and_finalize_callbacks DONE")
+                logger.info("[DEBUG dist_ckpt.save] step 4c: FileSystemWriterAsync + save_state_dict_async_plan START")
+                writer = FileSystemWriterAsync(
+                    ckpt_dir,
+                    separation_hint=inner_strategy.separation_hint,
+                    thread_count=inner_strategy.thread_count,
+                    use_msc=MultiStorageClientFeature.is_enabled(),
+                )
+                coordinator = 0
+                args_cached_plans = None
+                loaded_all_plans = None
+                if inner_strategy.use_cached_ckpt_structure:
+                    loaded_all_plans = getattr(inner_strategy.cached_global_metadata, "all_local_plans", None)
+                    args_cached_plans = (
+                        inner_strategy.cached_central_plan,
+                        inner_strategy.cached_local_plan,
+                        inner_strategy.validated_cache_reuse,
+                    )
 
-            # -- 4e: execute_sync (preload + write + barrier + finalize) --
-            # Break execute_sync into sub-steps
-            logger.info("[DEBUG dist_ckpt.save] step 4e: execute_sync START")
-            async_fn_args = list(async_request.async_fn_args)
-            if async_request.preload_fn:
-                logger.info("[DEBUG dist_ckpt.save] step 4e-preload: preload_fn START")
-                assert len(async_fn_args) == 3, "Expected 3 args to be passed to async function"
-                async_fn_args[1] = async_request.preload_fn()
-                logger.info("[DEBUG dist_ckpt.save] step 4e-preload: preload_fn DONE")
+                (
+                    save_state_dict_ret,
+                    inner_strategy.cached_central_plan,
+                    inner_strategy.cached_local_plan,
+                    inner_strategy.validated_cache_reuse,
+                    inner_strategy.validated_loaded_metadata_reuse,
+                ) = save_state_dict_async_plan(
+                    pyt_state_dict,
+                    writer,
+                    None,
+                    coordinator,
+                    planner=MCoreSavePlanner(
+                        dedup_replicated_tensors=not inner_strategy.keep_only_main_replica,
+                        flatten_state_dict=False,
+                    ),
+                    cached_ckpt_structure=args_cached_plans,
+                    loaded_all_plans=loaded_all_plans,
+                )
+                logger.info("[DEBUG dist_ckpt.save] step 4c: save_state_dict_async_plan DONE")
 
-            if async_request.async_fn is not None:
-                logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) START")
-                async_request.async_fn(*async_fn_args, **async_request.async_fn_kwargs)
-                logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) DONE")
+                # Handle cached metadata reuse (same as async_save logic)
+                rank = torch.distributed.get_rank()
+                if inner_strategy.use_cached_ckpt_structure:
+                    if (
+                        loaded_all_plans
+                        and inner_strategy.cached_global_metadata
+                        and inner_strategy.validated_loaded_metadata_reuse
+                    ):
+                        if coordinator == rank:
+                            save_state_dict_ret = list(save_state_dict_ret)
+                            save_state_dict_ret[1] = inner_strategy.cached_global_metadata
+                    elif inner_strategy.validated_cache_reuse:
+                        if save_state_dict_ret[1]:
+                            inner_strategy.cached_global_metadata = save_state_dict_ret[1]
+                        elif coordinator == rank:
+                            save_state_dict_ret = list(save_state_dict_ret)
+                            save_state_dict_ret[1] = inner_strategy.cached_global_metadata
 
-            logger.info("[DEBUG dist_ckpt.save] step 4e-barrier: torch.distributed.barrier START")
-            torch.distributed.barrier()
-            logger.info("[DEBUG dist_ckpt.save] step 4e-barrier: torch.distributed.barrier DONE")
+                logger.info("[DEBUG dist_ckpt.save] step 4d: _get_save_and_finalize_callbacks START")
+                async_req = inner_strategy._get_save_and_finalize_callbacks(writer, save_state_dict_ret)
+                logger.info("[DEBUG dist_ckpt.save] step 4d: _get_save_and_finalize_callbacks DONE")
+                return async_req
 
-            logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize: {len(async_request.finalize_fns)} finalize_fns START")
-            for i, finalize_fn in enumerate(async_request.finalize_fns):
-                logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize[{i}]: {finalize_fn} START")
-                finalize_fn()
-                logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize[{i}]: DONE")
-            logger.info("[DEBUG dist_ckpt.save] step 4e: execute_sync DONE")
+            # Patch the inner strategy
+            inner_strategy.async_save = _debug_inner_async_save
+
+            def _debug_wrapper_save(sd, ckpt_dir):
+                # FullyParallelSaveStrategyWrapper.save calls:
+                #   apply_saving_parallelization(sd) then base_strategy.save(sd, ckpt_dir)
+                # And base_strategy.save (AsyncSaveShardedStrategy.save) calls:
+                #   async_request = async_save(sd, ckpt_dir) then async_request.execute_sync()
+                #
+                # We already patched inner async_save for sub-step logging.
+                # Now we also need to log around execute_sync sub-steps.
+                # Override base_strategy.save to break execute_sync apart.
+
+                if isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper):
+                    logger.info("[DEBUG dist_ckpt.save] step 4-parallel: apply_saving_parallelization START")
+                    sharded_strategy.apply_saving_parallelization(sd)
+                    logger.info("[DEBUG dist_ckpt.save] step 4-parallel: apply_saving_parallelization DONE")
+                    async_request = inner_strategy.async_save(sd, ckpt_dir)
+                else:
+                    async_request = inner_strategy.async_save(sd, ckpt_dir)
+
+                # -- execute_sync broken into sub-steps --
+                logger.info("[DEBUG dist_ckpt.save] step 4e: execute_sync START")
+                async_fn_args = list(async_request.async_fn_args)
+                if async_request.preload_fn:
+                    logger.info("[DEBUG dist_ckpt.save] step 4e-preload: preload_fn START")
+                    assert len(async_fn_args) == 3, "Expected 3 args"
+                    async_fn_args[1] = async_request.preload_fn()
+                    logger.info("[DEBUG dist_ckpt.save] step 4e-preload: preload_fn DONE")
+
+                if async_request.async_fn is not None:
+                    logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) START")
+                    async_request.async_fn(*async_fn_args, **async_request.async_fn_kwargs)
+                    logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) DONE")
+
+                logger.info("[DEBUG dist_ckpt.save] step 4e-barrier: torch.distributed.barrier START")
+                torch.distributed.barrier()
+                logger.info("[DEBUG dist_ckpt.save] step 4e-barrier: torch.distributed.barrier DONE")
+
+                logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize: {len(async_request.finalize_fns)} finalize_fns START")
+                for i, finalize_fn in enumerate(async_request.finalize_fns):
+                    logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize[{i}]: {finalize_fn} START")
+                    finalize_fn()
+                    logger.info(f"[DEBUG dist_ckpt.save] step 4e-finalize[{i}]: DONE")
+                logger.info("[DEBUG dist_ckpt.save] step 4e: execute_sync DONE")
+
+            try:
+                _debug_wrapper_save(sharded_state_dict, checkpoint_dir)
+            finally:
+                inner_strategy.async_save = _orig_inner_async_save
 
             logger.info("[DEBUG dist_ckpt.save] step 4/5: sharded_strategy.save DONE (expanded)")
 
