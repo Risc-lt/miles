@@ -676,16 +676,51 @@ def save(
     args = get_args()
     if should_disable_forward_pre_hook(args):
         disable_forward_pre_hook(model)
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far=0,
-        checkpointing_context=None,
-        train_data_iterator=None,
-        preprocess_common_state_dict_fn=None,
-    )
+
+    # Monkey-patch dist_checkpointing.save to add debug logging inside save_checkpoint.
+    # save_checkpoint calls dist_checkpointing.save() via module attribute, so this works.
+    import megatron.core.dist_checkpointing as _dist_ckpt_module
+    import megatron.core.dist_checkpointing.serialization as _ser_module
+
+    _orig_dist_save = _dist_ckpt_module.save
+    _orig_save_preprocess = _ser_module.save_preprocess
+
+    def _debug_save_preprocess(sharded_state_dict, validate_access_integrity, preprocess_fn=None):
+        logger.info("[DEBUG save_checkpoint] >>> save_preprocess START (includes validation)")
+        try:
+            result = _orig_save_preprocess(sharded_state_dict, validate_access_integrity, preprocess_fn)
+            logger.info("[DEBUG save_checkpoint] <<< save_preprocess DONE (validation passed)")
+            return result
+        except Exception as e:
+            logger.error(f"[DEBUG save_checkpoint] !!! save_preprocess FAILED: {e}")
+            raise
+
+    def _debug_dist_save(sharded_state_dict, checkpoint_dir, sharded_strategy=None, **kwargs):
+        logger.info(f"[DEBUG save_checkpoint] >>> dist_checkpointing.save START (checkpoint_dir={checkpoint_dir})")
+        result = _orig_dist_save(sharded_state_dict, checkpoint_dir, sharded_strategy, **kwargs)
+        logger.info("[DEBUG save_checkpoint] <<< dist_checkpointing.save DONE")
+        return result
+
+    # Patch both the module-level references so save_checkpoint picks up our wrappers
+    _dist_ckpt_module.save = _debug_dist_save
+    _ser_module.save_preprocess = _debug_save_preprocess
+    try:
+        logger.info(f"[DEBUG save_checkpoint] >>> save_checkpoint START (iteration={iteration})")
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far=0,
+            checkpointing_context=None,
+            train_data_iterator=None,
+            preprocess_common_state_dict_fn=None,
+        )
+        logger.info(f"[DEBUG save_checkpoint] <<< save_checkpoint DONE (iteration={iteration})")
+    finally:
+        _dist_ckpt_module.save = _orig_dist_save
+        _ser_module.save_preprocess = _orig_save_preprocess
+
     if should_disable_forward_pre_hook(args):
         enable_forward_pre_hook(model)
 
