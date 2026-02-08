@@ -696,10 +696,96 @@ def save(
             raise
 
     def _debug_dist_save(sharded_state_dict, checkpoint_dir, sharded_strategy=None, **kwargs):
-        logger.info(f"[DEBUG save_checkpoint] >>> dist_checkpointing.save START (checkpoint_dir={checkpoint_dir})")
-        result = _orig_dist_save(sharded_state_dict, checkpoint_dir, sharded_strategy, **kwargs)
-        logger.info("[DEBUG save_checkpoint] <<< dist_checkpointing.save DONE")
-        return result
+        """Instrumented version of dist_checkpointing.save with per-step logging."""
+        import torch
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+        from megatron.core.dist_checkpointing.serialization import (
+            CheckpointingConfig,
+            SaveCommonStrategy,
+            SaveShardedStrategy,
+            AsyncSaveShardedStrategy,
+            get_default_save_sharded_strategy,
+            get_default_save_common_strategy,
+            get_default_strategy,
+            save_config,
+            validate_sharded_objects_handling,
+        )
+        from megatron.core.dist_checkpointing.serialization import StrategyAction, _CONTENT_METADATA_KEY
+        from megatron.core.dist_checkpointing.utils import extract_matching_values
+
+        logger.info(f"[DEBUG dist_ckpt.save] >>> ENTER (checkpoint_dir={checkpoint_dir})")
+
+        validate_access_integrity = kwargs.get('validate_access_integrity', True)
+        async_sharded_save = kwargs.get('async_sharded_save', False)
+        preprocess_fn = kwargs.get('preprocess_common_before_consistancy_check', None)
+        common_strategy = kwargs.get('common_strategy', None)
+        content_metadata = kwargs.get('content_metadata', None)
+
+        # Strategy init
+        if sharded_strategy is None:
+            sharded_strategy = get_default_save_sharded_strategy()
+        if not isinstance(sharded_strategy, SaveShardedStrategy):
+            sharded_strategy = get_default_strategy(StrategyAction.SAVE_SHARDED, *sharded_strategy)
+        if common_strategy is None:
+            common_strategy = get_default_save_common_strategy()
+        if not isinstance(common_strategy, SaveCommonStrategy):
+            common_strategy = get_default_strategy(StrategyAction.SAVE_COMMON, *common_strategy)
+
+        if content_metadata is not None:
+            sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
+
+        # Step 1: save_preprocess (validation)
+        logger.info("[DEBUG dist_ckpt.save] step 1/5: save_preprocess (validation)")
+        sharded_state_dict, state_dict = _debug_save_preprocess(
+            sharded_state_dict, validate_access_integrity, preprocess_fn
+        )
+
+        # Step 2: save_common
+        logger.info("[DEBUG dist_ckpt.save] step 2/5: common_strategy.save_common")
+        common_strategy.save_common(state_dict, checkpoint_dir)
+        logger.info("[DEBUG dist_ckpt.save] step 2/5: common_strategy.save_common DONE")
+
+        # Step 3: save sharded objects
+        if not sharded_strategy.can_handle_sharded_objects:
+            logger.info("[DEBUG dist_ckpt.save] step 3/5: save_sharded_objects")
+            validate_sharded_objects_handling(sharded_strategy, common_strategy)
+            sharded_objects_state_dict, sharded_state_dict = extract_matching_values(
+                sharded_state_dict, lambda v: isinstance(v, ShardedObject)
+            )
+            common_strategy.save_sharded_objects(sharded_objects_state_dict, checkpoint_dir)
+            logger.info("[DEBUG dist_ckpt.save] step 3/5: save_sharded_objects DONE")
+        else:
+            logger.info("[DEBUG dist_ckpt.save] step 3/5: skipped (strategy handles sharded objects)")
+
+        def metadata_finalize_fn():
+            if torch.distributed.get_rank() == 0:
+                save_config(
+                    CheckpointingConfig(sharded_strategy.backend, sharded_strategy.version),
+                    checkpoint_dir,
+                )
+            torch.distributed.barrier()
+
+        # Step 4: save sharded tensors
+        if not async_sharded_save:
+            logger.info("[DEBUG dist_ckpt.save] step 4/5: sharded_strategy.save (synchronous)")
+            sharded_strategy.save(sharded_state_dict, checkpoint_dir)
+            logger.info("[DEBUG dist_ckpt.save] step 4/5: sharded_strategy.save DONE")
+
+            # Step 5: metadata finalize
+            logger.info("[DEBUG dist_ckpt.save] step 5/5: metadata_finalize_fn")
+            metadata_finalize_fn()
+            logger.info("[DEBUG dist_ckpt.save] step 5/5: metadata_finalize_fn DONE")
+            logger.info("[DEBUG dist_ckpt.save] <<< EXIT (sync save complete)")
+            return None
+
+        # Async path
+        logger.info("[DEBUG dist_ckpt.save] step 4/5: sharded_strategy.async_save")
+        if not isinstance(sharded_strategy, AsyncSaveShardedStrategy):
+            raise Exception(f'Cannot apply async_save to non-async strategy {sharded_strategy}')
+        async_request = sharded_strategy.async_save(sharded_state_dict, checkpoint_dir)
+        async_request.finalize_fns.append(metadata_finalize_fn)
+        logger.info("[DEBUG dist_ckpt.save] <<< EXIT (async request created)")
+        return async_request
 
     # Patch both the module-level references so save_checkpoint picks up our wrappers
     _dist_ckpt_module.save = _debug_dist_save
