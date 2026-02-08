@@ -165,6 +165,8 @@ class TransferBundle:
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
     # Local buffer to check for parameter readiness before transfer
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
+    # Original param shapes/dtypes saved during offload for reallocation
+    _param_originals: list = dataclasses.field(default_factory=list)
 
     @property
     def params_dict(self):
@@ -458,10 +460,20 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             return
         for transfer_bundle in self.engines.values():
             if transfer_bundle._offloaded:
-                # Realloc model replica on GPU since we don't need the last values
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
+                # Reallocate model replica on GPU with fresh storage.
+                # We use new tensors instead of resize_ to avoid stale GPU pointers.
+                cuda_device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                for weight, (orig_shape, orig_dtype) in zip(
+                    transfer_bundle.model_replica.parameters(),
+                    transfer_bundle._param_originals,
+                ):
+                    weight.data = torch.empty(orig_shape, dtype=orig_dtype, device=cuda_device)
                 transfer_bundle._offloaded = False
+
+                # Recreate TransferEngine if it was destroyed during previous offload
+                if transfer_bundle.engine is None:
+                    transfer_bundle.engine = self._create_transfer_engine()
+
                 transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
                     self._register_replica_memory(
                         transfer_bundle.model_replica,
@@ -506,14 +518,33 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         print_memory("[RDMA] Before offloading model replica")
         for transfer_bundle in self.engines.values():
             if not transfer_bundle._offloaded:
-                # Unregister RDMA memory regions before offloading to CPU
-                logger.info("[RDMA] Unregistering memory before offload to CPU...")
+                # Unregister RDMA memory regions before offloading
+                logger.info("[RDMA] Unregistering memory before offload...")
                 self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
 
-                # Release GPU memory
+                # Replace GPU tensors with empty CPU tensors to fully release GPU storage.
+                # Using param.data assignment instead of resize_(0) ensures the old GPU
+                # storage is completely dereferenced, preventing Go runtime signal handler
+                # from retaining hooks on freed GPU pages.
+                # Save original shapes/dtypes for reallocation.
+                transfer_bundle._param_originals = [
+                    (weight.shape, weight.dtype) for weight in transfer_bundle.model_replica.parameters()
+                ]
                 for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(0)
+                    weight.data = torch.empty(0, dtype=weight.dtype, device="cpu")
                 transfer_bundle._offloaded = True
+
+        # Destroy TransferEngine instances to fully release Go runtime state,
+        # including any residual references to GPU memory regions.
+        logger.info("[RDMA] Destroying TransferEngine instances to release Go runtime references...")
+        for transfer_bundle in self.engines.values():
+            if transfer_bundle.engine is not None:
+                del transfer_bundle.engine
+                transfer_bundle.engine = None
+
+        import gc
+        gc.collect()
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
         print_memory("[RDMA] After offloading model replica")
 
