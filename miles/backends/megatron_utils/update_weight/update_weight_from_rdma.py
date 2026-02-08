@@ -522,15 +522,16 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 logger.info("[RDMA] Unregistering memory before offload...")
                 self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
 
-                # Replace GPU tensors with empty CPU tensors to fully release GPU storage.
-                # Using param.data assignment instead of resize_(0) ensures the old GPU
-                # storage is completely dereferenced, preventing Go runtime signal handler
-                # from retaining hooks on freed GPU pages.
+                # Two-step GPU memory release:
+                # 1. resize_(0) to immediately free GPU storage back to CUDA allocator cache
+                # 2. Replace with CPU tensor to fully dereference the GPU storage object,
+                #    preventing Go runtime signal handler from retaining hooks on freed pages.
                 # Save original shapes/dtypes for reallocation.
                 transfer_bundle._param_originals = [
                     (weight.shape, weight.dtype) for weight in transfer_bundle.model_replica.parameters()
                 ]
                 for weight in transfer_bundle.model_replica.parameters():
+                    weight.untyped_storage().resize_(0)
                     weight.data = torch.empty(0, dtype=weight.dtype, device="cpu")
                 transfer_bundle._offloaded = True
 
