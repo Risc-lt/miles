@@ -932,34 +932,43 @@ def save(
                     # in the child when it accesses any memory that triggers the inherited handler.
                     # We use sigaction via ctypes to properly override Go's C-level handler.
                     def _child_target_wrapper(original_fn, **kwargs):
-                        import ctypes
-                        import ctypes.util
+                        import os as _os
+                        _pid = _os.getpid()
+                        # Write directly to fd 2 (stderr) to bypass Python logging/buffering
+                        _os.write(2, f"[child pid={_pid}] _child_target_wrapper ENTERED\n".encode())
 
-                        _SIGSEGV = 11
-                        _SIGBUS = 7
+                        try:
+                            import ctypes
+                            import ctypes.util
 
-                        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                            _SIGSEGV = 11
+                            _SIGBUS = 7
 
-                        # Use sigaction to fully reset signal handlers (Go uses sigaction with
-                        # SA_SIGINFO | SA_ONSTACK flags that signal() may not fully override).
-                        # struct sigaction { sa_handler/sa_sigaction, sa_mask, sa_flags, sa_restorer }
-                        # On x86_64 Linux: sa_handler(8) + sa_mask(128) + sa_flags(4) + sa_restorer(8) = 152 bytes
-                        _SA_STRUCT_SIZE = 152
-                        _SIG_DFL = 0
+                            _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
 
-                        # Build a default sigaction struct: handler=SIG_DFL, empty mask, flags=0
-                        _sa_default = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-                        # sa_handler at offset 0 (8 bytes pointer)
-                        ctypes.memmove(_sa_default, ctypes.c_void_p(_SIG_DFL), 8)
+                            # Use sigaction to fully reset signal handlers (Go uses sigaction with
+                            # SA_SIGINFO | SA_ONSTACK flags that signal() may not fully override).
+                            _SA_STRUCT_SIZE = 152
+                            _SIG_DFL = 0
 
-                        _libc.sigaction(_SIGSEGV, _sa_default, None)
-                        _libc.sigaction(_SIGBUS, _sa_default, None)
+                            # Build a default sigaction struct: handler=SIG_DFL, empty mask, flags=0
+                            _sa_default = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
+                            ctypes.memmove(_sa_default, ctypes.c_void_p(_SIG_DFL), 8)
 
-                        # Also use signal() as a belt-and-suspenders approach
-                        _libc.signal(_SIGSEGV, _SIG_DFL)
-                        _libc.signal(_SIGBUS, _SIG_DFL)
+                            _libc.sigaction(_SIGSEGV, _sa_default, None)
+                            _libc.sigaction(_SIGBUS, _sa_default, None)
+                            _libc.signal(_SIGSEGV, _SIG_DFL)
+                            _libc.signal(_SIGBUS, _SIG_DFL)
 
-                        return original_fn(**kwargs)
+                            _os.write(2, f"[child pid={_pid}] signal handlers reset, calling original_fn\n".encode())
+                            result = original_fn(**kwargs)
+                            _os.write(2, f"[child pid={_pid}] original_fn completed successfully\n".encode())
+                            return result
+                        except Exception as _e:
+                            _os.write(2, f"[child pid={_pid}] EXCEPTION in child: {_e}\n".encode())
+                            import traceback as _tb
+                            _os.write(2, f"[child pid={_pid}] {_tb.format_exc()}\n".encode())
+                            raise
 
                     if _write_buckets:
                         _gc_was_enabled = _gc.isenabled()
@@ -998,36 +1007,15 @@ def save(
                                     )
                                 )
                             logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: created {len(_p_list)} processes, starting them")
-
-                            # Save parent's SIGSEGV/SIGBUS handlers, reset to SIG_DFL before fork,
-                            # so children inherit default handlers instead of Go runtime's.
-                            import ctypes
-                            import ctypes.util
-                            _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-                            _SIGSEGV = 11
-                            _SIGBUS = 7
-                            _SA_STRUCT_SIZE = 152  # struct sigaction on x86_64 Linux
-                            _sa_default = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-                            _sa_old_segv = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-                            _sa_old_bus = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-
-                            # Save current handlers
-                            _libc.sigaction(_SIGSEGV, None, _sa_old_segv)
-                            _libc.sigaction(_SIGBUS, None, _sa_old_bus)
-                            # Reset to SIG_DFL before fork
-                            _libc.sigaction(_SIGSEGV, _sa_default, None)
-                            _libc.sigaction(_SIGBUS, _sa_default, None)
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: parent SIGSEGV/SIGBUS reset to SIG_DFL before fork")
+                            # NOTE: Do NOT reset parent's signal handlers before fork.
+                            # Resetting to SIG_DFL makes the parent vulnerable to SIGSEGV during the
+                            # fork syscall itself (Go runtime state can trigger SIGSEGV during fork).
+                            # Instead, children reset their own handlers via _child_target_wrapper.
 
                             for _pi, _p in enumerate(_p_list):
                                 logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: starting process {_pi}")
                                 _p.start()
                                 logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: started process {_pi} (pid={_p.pid})")
-
-                            # Restore parent's original signal handlers after fork
-                            _libc.sigaction(_SIGSEGV, _sa_old_segv, None)
-                            _libc.sigaction(_SIGBUS, _sa_old_bus, None)
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: parent SIGSEGV/SIGBUS restored after fork")
 
                             logger.info("[DEBUG dist_ckpt.save] step 4e-write: all processes started, waiting for completion")
                             # Poll for completion instead of count_queue.join() which blocks forever
