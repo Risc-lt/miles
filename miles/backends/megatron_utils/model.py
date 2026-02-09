@@ -905,89 +905,23 @@ def save(
 
                 if async_request.async_fn is not None:
                     logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) START")
-                    # Expand write_preloaded_data_multiproc inline for sub-step logging.
-                    # async_fn is partial(write_preloaded_data_multiproc, transform_list, use_msc)
-                    # async_fn_args = [rank, write_buckets, results_queue]
+                    # Write checkpoint files sequentially (no fork).
                     import gc as _gc
-                    from torch import multiprocessing as _mp
-                    from functools import partial as _partial
                     from time import time as _time
-                    from megatron.core.dist_checkpointing.strategies.filesystem_async import (
-                        FileSystemWriterAsync as _FSWA,
-                    )
 
                     _write_rank = async_fn_args[0]
                     _write_buckets = async_fn_args[1]
                     _results_queue = async_fn_args[2] if len(async_fn_args) > 2 else None
 
-                    # Extract transform_list and use_msc from the partial
+                    # Extract transform_list from the partial
                     _transform_list = async_request.async_fn.args[0] if hasattr(async_request.async_fn, 'args') else []
-                    _use_msc = async_request.async_fn.args[1] if hasattr(async_request.async_fn, 'args') and len(async_request.async_fn.args) > 1 else False
 
                     logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: rank={_write_rank}, num_buckets={len(_write_buckets) if _write_buckets else 0}")
 
-                    # Pre-load ctypes and libc in the parent so they're available immediately
-                    # in the forked child (fork copies parent's memory, including loaded libraries).
-                    # This avoids the child crashing during ctypes import/initialization.
-                    import ctypes as _ctypes
-                    import ctypes.util as _ctypes_util
-                    import os as _child_os
-
-                    _libc_path = _ctypes_util.find_library("c")
-                    _libc = _ctypes.CDLL(_libc_path, use_errno=True)
-                    _SIGSEGV_CONST = 11
-                    _SIGBUS_CONST = 7
-                    _SA_STRUCT_SIZE = 152  # struct sigaction on x86_64 Linux
-                    _SIG_DFL_CONST = 0
-
-                    # Pre-build the default sigaction struct in the parent
-                    _sa_default_buf = _ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-                    _ctypes.memmove(_sa_default_buf, _ctypes.c_void_p(_SIG_DFL_CONST), 8)
-
-                    # Register a fork handler that resets signal handlers in the child
-                    # immediately after fork(), before any other Python code runs.
-                    # This is the earliest possible hook after fork().
-                    _fork_handler_registered = [False]
-
-                    def _after_fork_in_child():
-                        """Reset Go runtime's signal handlers immediately after fork."""
-                        try:
-                            _libc.sigaction(_SIGSEGV_CONST, _sa_default_buf, None)
-                            _libc.sigaction(_SIGBUS_CONST, _sa_default_buf, None)
-                            _libc.signal(_SIGSEGV_CONST, _SIG_DFL_CONST)
-                            _libc.signal(_SIGBUS_CONST, _SIG_DFL_CONST)
-                        except Exception:
-                            pass  # Best effort - don't crash the child if this fails
-
-                    if not _fork_handler_registered[0]:
-                        _child_os.register_at_fork(after_in_child=_after_fork_in_child)
-                        _fork_handler_registered[0] = True
-                        logger.info("[DEBUG dist_ckpt.save] step 4e-write: registered after_fork_in_child signal reset handler")
-
-                    # Child wrapper still does signal reset as belt-and-suspenders
-                    # (in case register_at_fork didn't fully work)
-                    def _child_target_wrapper(original_fn, **kwargs):
-                        _pid = _child_os.getpid()
-                        _child_os.write(2, f"[child pid={_pid}] _child_target_wrapper ENTERED\n".encode())
-
-                        try:
-                            # Signal handlers should already be reset by _after_fork_in_child,
-                            # but reset again as belt-and-suspenders.
-                            _libc.sigaction(_SIGSEGV_CONST, _sa_default_buf, None)
-                            _libc.sigaction(_SIGBUS_CONST, _sa_default_buf, None)
-                            _libc.signal(_SIGSEGV_CONST, _SIG_DFL_CONST)
-                            _libc.signal(_SIGBUS_CONST, _SIG_DFL_CONST)
-
-                            _child_os.write(2, f"[child pid={_pid}] signal handlers reset, calling original_fn\n".encode())
-                            result = original_fn(**kwargs)
-                            _child_os.write(2, f"[child pid={_pid}] original_fn completed successfully\n".encode())
-                            return result
-                        except Exception as _e:
-                            _child_os.write(2, f"[child pid={_pid}] EXCEPTION in child: {_e}\n".encode())
-                            import traceback as _tb
-                            _child_os.write(2, f"[child pid={_pid}] {_tb.format_exc()}\n".encode())
-                            raise
-
+                    # BYPASS fork-based multiproc write entirely.
+                    # Go runtime (mooncake TransferEngine) installs signal handlers via sigaction
+                    # that are incompatible with fork() — any fork triggers SIGSEGV via runtime.sigfwd.
+                    # Instead, write checkpoint files sequentially in the parent process.
                     if _write_buckets:
                         _gc_was_enabled = _gc.isenabled()
                         if _gc_was_enabled:
@@ -995,103 +929,46 @@ def save(
                         try:
                             _w_start = _time()
                             _write_results_or_exc = dict()
-                            _ctx = _mp.get_context("fork")
-                            _local_results_queue = _ctx.Queue()
-                            _count_queue = _ctx.JoinableQueue()
-                            _p_list = []
+                            import os as _os
+                            import inspect as _inspect_mod
+                            from torch.distributed.checkpoint.filesystem import _write_item as _write_item_fn
 
-                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: creating {len(_write_buckets)} fork processes (with signal reset)")
+                            # Check if _write_item supports serialization_format
+                            _extra_kwargs = {}
+                            if "serialization_format" in _inspect_mod.signature(_write_item_fn).parameters:
+                                from torch.distributed.checkpoint.filesystem import SerializationFormat
+                                _extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
+
                             for _i, _write_bucket in enumerate(_write_buckets):
-                                _count_queue.put(_i)
-                                _kwargs = {
-                                    "local_proc_idx": _i,
-                                    "write_bucket": _write_bucket,
-                                    "results_queue": _local_results_queue,
-                                    "count_queue": _count_queue,
-                                    "use_fsync": True,
-                                }
-                                if _use_msc:
-                                    import inspect as _inspect
-                                    _signature = _inspect.signature(_FSWA.write_preloaded_data)
-                                    if len(_signature.parameters) > 6:
-                                        _kwargs["use_msc"] = _use_msc
-                                _p_list.append(
-                                    _ctx.Process(
-                                        target=_partial(
-                                            _child_target_wrapper,
-                                            _partial(_FSWA.write_preloaded_data, _transform_list),
-                                        ),
-                                        kwargs=_kwargs,
-                                    )
-                                )
-                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: created {len(_p_list)} processes, starting them")
-                            # NOTE: Do NOT reset parent's signal handlers before fork.
-                            # Resetting to SIG_DFL makes the parent vulnerable to SIGSEGV during the
-                            # fork syscall itself (Go runtime state can trigger SIGSEGV during fork).
-                            # Instead, children reset their own handlers via _child_target_wrapper.
-
-                            for _pi, _p in enumerate(_p_list):
-                                logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: starting process {_pi}")
-                                _p.start()
-                                logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: started process {_pi} (pid={_p.pid})")
-
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all processes started, waiting for completion")
-                            # Poll for completion instead of count_queue.join() which blocks forever
-                            # if a child dies (e.g. SIGSEGV with SIG_DFL kills process silently).
-                            import time as _time_mod
-                            _POLL_INTERVAL = 2.0
-                            _MAX_WAIT = 1200  # 20 minutes max
-                            _wait_start = _time_mod.time()
-                            _all_done = False
-                            while not _all_done:
-                                # Check if all children are still alive
-                                _dead_children = []
-                                for _pi2, _p2 in enumerate(_p_list):
-                                    if not _p2.is_alive() and _p2.exitcode is not None:
-                                        if _p2.exitcode != 0:
-                                            _dead_children.append((_pi2, _p2.exitcode))
-                                if _dead_children:
-                                    for _dc_idx, _dc_exit in _dead_children:
-                                        logger.error(
-                                            f"[DEBUG dist_ckpt.save] step 4e-write: child process {_dc_idx} "
-                                            f"(pid={_p_list[_dc_idx].pid}) DIED with exit code {_dc_exit} "
-                                            f"(signal {-_dc_exit if _dc_exit < 0 else 'N/A'})"
-                                        )
-                                    raise RuntimeError(
-                                        f"Checkpoint write child process(es) died: "
-                                        f"{[(idx, code) for idx, code in _dead_children]}"
-                                    )
-                                # Try non-blocking join on the count_queue
-                                # All tasks done = unfinished_tasks == 0
-                                if _count_queue._unfinished_tasks._semlock._get_value() == 0:  # type: ignore
-                                    _all_done = True
+                                _local_results = []
+                                try:
+                                    _file_name, _storage_key, (_bytes_data, _tensor_data) = _write_bucket
+                                    logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: writing bucket {_i} to {_file_name}")
+                                    with open(_file_name, "wb") as _stream:
+                                        for _write_item, _data in _bytes_data:
+                                            _local_results.append(
+                                                _write_item_fn(
+                                                    *_transform_list, _stream, _data, _write_item, _storage_key, **_extra_kwargs
+                                                )
+                                            )
+                                        for _write_item, _tensor in _tensor_data:
+                                            assert _tensor.is_cpu
+                                            _local_results.append(
+                                                _write_item_fn(
+                                                    *_transform_list, _stream, _tensor, _write_item, _storage_key, **_extra_kwargs
+                                                )
+                                            )
+                                        _os.fsync(_stream.fileno())
+                                    _write_results_or_exc[_i] = _local_results
+                                    logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: bucket {_i} done ({len(_local_results)} items)")
+                                except Exception as _e:
+                                    logger.error(f"[DEBUG dist_ckpt.save] step 4e-write: bucket {_i} FAILED: {_e}")
+                                    _write_results_or_exc = _e
                                     break
-                                if _time_mod.time() - _wait_start > _MAX_WAIT:
-                                    # Log status of all children
-                                    for _pi2, _p2 in enumerate(_p_list):
-                                        logger.error(
-                                            f"[DEBUG dist_ckpt.save] step 4e-write: timeout - child {_pi2} "
-                                            f"alive={_p2.is_alive()}, exitcode={_p2.exitcode}"
-                                        )
-                                    raise RuntimeError(
-                                        f"Checkpoint write timed out after {_MAX_WAIT}s waiting for child processes"
-                                    )
-                                _time_mod.sleep(_POLL_INTERVAL)
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all children completed, collecting results")
 
-                            for _proc_idx in range(len(_write_buckets)):
-                                _local_proc_idx, _local_results_or_exc = _local_results_queue.get()
-                                if isinstance(_local_results_or_exc, Exception):
-                                    logger.error(f"[DEBUG dist_ckpt.save] step 4e-write: process {_local_proc_idx} FAILED: {_local_results_or_exc}")
-                                    _write_results_or_exc = _local_results_or_exc
-                                    break
-                                _write_results_or_exc[_local_proc_idx] = _local_results_or_exc
-                                _p_list[_local_proc_idx].join()
-
-                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: results collected, putting to global queue")
                             _results_queue.put(_write_results_or_exc)
                             _w_end = _time()
-                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: done in {_w_end - _w_start:.2f}s")
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: done in {_w_end - _w_start:.2f}s (sequential, no fork)")
                         finally:
                             if _gc_was_enabled:
                                 _gc.enable()
