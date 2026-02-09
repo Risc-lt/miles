@@ -905,7 +905,90 @@ def save(
 
                 if async_request.async_fn is not None:
                     logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) START")
-                    async_request.async_fn(*async_fn_args, **async_request.async_fn_kwargs)
+                    # Expand write_preloaded_data_multiproc inline for sub-step logging.
+                    # async_fn is partial(write_preloaded_data_multiproc, transform_list, use_msc)
+                    # async_fn_args = [rank, write_buckets, results_queue]
+                    import gc as _gc
+                    from torch import multiprocessing as _mp
+                    from functools import partial as _partial
+                    from time import time as _time
+                    from megatron.core.dist_checkpointing.strategies.filesystem_async import (
+                        FileSystemWriterAsync as _FSWA,
+                    )
+
+                    _write_rank = async_fn_args[0]
+                    _write_buckets = async_fn_args[1]
+                    _results_queue = async_fn_args[2] if len(async_fn_args) > 2 else None
+
+                    # Extract transform_list and use_msc from the partial
+                    _transform_list = async_request.async_fn.args[0] if hasattr(async_request.async_fn, 'args') else []
+                    _use_msc = async_request.async_fn.args[1] if hasattr(async_request.async_fn, 'args') and len(async_request.async_fn.args) > 1 else False
+
+                    logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: rank={_write_rank}, num_buckets={len(_write_buckets) if _write_buckets else 0}")
+
+                    if _write_buckets:
+                        _gc_was_enabled = _gc.isenabled()
+                        if _gc_was_enabled:
+                            _gc.disable()
+                        try:
+                            _w_start = _time()
+                            _write_results_or_exc = dict()
+                            _ctx = _mp.get_context("fork")
+                            _local_results_queue = _ctx.Queue()
+                            _count_queue = _ctx.JoinableQueue()
+                            _p_list = []
+
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: creating {len(_write_buckets)} fork processes")
+                            for _i, _write_bucket in enumerate(_write_buckets):
+                                _count_queue.put(_i)
+                                _kwargs = {
+                                    "local_proc_idx": _i,
+                                    "write_bucket": _write_bucket,
+                                    "results_queue": _local_results_queue,
+                                    "count_queue": _count_queue,
+                                    "use_fsync": True,
+                                }
+                                if _use_msc:
+                                    import inspect as _inspect
+                                    _signature = _inspect.signature(_FSWA.write_preloaded_data)
+                                    if len(_signature.parameters) > 6:
+                                        _kwargs["use_msc"] = _use_msc
+                                _p_list.append(
+                                    _ctx.Process(
+                                        target=_partial(_FSWA.write_preloaded_data, _transform_list),
+                                        kwargs=_kwargs,
+                                    )
+                                )
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: created {len(_p_list)} processes, starting them")
+
+                            for _pi, _p in enumerate(_p_list):
+                                logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: starting process {_pi}")
+                                _p.start()
+                                logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: started process {_pi} (pid={_p.pid})")
+
+                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all processes started, joining count_queue")
+                            _count_queue.join()
+                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: count_queue joined, collecting results")
+
+                            for _proc_idx in range(len(_write_buckets)):
+                                _local_proc_idx, _local_results_or_exc = _local_results_queue.get()
+                                if isinstance(_local_results_or_exc, Exception):
+                                    logger.error(f"[DEBUG dist_ckpt.save] step 4e-write: process {_local_proc_idx} FAILED: {_local_results_or_exc}")
+                                    _write_results_or_exc = _local_results_or_exc
+                                    break
+                                _write_results_or_exc[_local_proc_idx] = _local_results_or_exc
+                                _p_list[_local_proc_idx].join()
+
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: results collected, putting to global queue")
+                            _results_queue.put(_write_results_or_exc)
+                            _w_end = _time()
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: done in {_w_end - _w_start:.2f}s")
+                        finally:
+                            if _gc_was_enabled:
+                                _gc.enable()
+                    else:
+                        logger.info("[DEBUG dist_ckpt.save] step 4e-write: no write_buckets, skipping")
+
                     logger.info("[DEBUG dist_ckpt.save] step 4e-write: async_fn (file write) DONE")
 
                 logger.info("[DEBUG dist_ckpt.save] step 4e-barrier: torch.distributed.barrier START")
