@@ -139,7 +139,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 3 "
+        "--num-rollout 4 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -250,7 +250,7 @@ def execute(args: ScriptArgs):
         "--use-pytorch-profiler-update-weight "
         "--profile-update-weight-start 2 "
         "--profile-update-weight-end 3 "
-        "--tensorboard-dir /root/newnew_profiler_logs/ "
+        f"--tensorboard-dir /root/new_{args.mode}_profiler_logs/ "
     )
     train_args = (
         f"{ckpt_args} "
