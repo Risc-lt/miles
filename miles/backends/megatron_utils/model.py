@@ -926,48 +926,66 @@ def save(
 
                     logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: rank={_write_rank}, num_buckets={len(_write_buckets) if _write_buckets else 0}")
 
-                    # Wrapper to reset Go runtime's SIGSEGV handler in the forked child.
-                    # fork() inherits the parent's signal handlers, including the Go runtime's
-                    # runtime.sigfwd installed by mooncake TransferEngine. This causes segfault
-                    # in the child when it accesses any memory that triggers the inherited handler.
-                    # We use sigaction via ctypes to properly override Go's C-level handler.
+                    # Pre-load ctypes and libc in the parent so they're available immediately
+                    # in the forked child (fork copies parent's memory, including loaded libraries).
+                    # This avoids the child crashing during ctypes import/initialization.
+                    import ctypes as _ctypes
+                    import ctypes.util as _ctypes_util
+                    import os as _child_os
+
+                    _libc_path = _ctypes_util.find_library("c")
+                    _libc = _ctypes.CDLL(_libc_path, use_errno=True)
+                    _SIGSEGV_CONST = 11
+                    _SIGBUS_CONST = 7
+                    _SA_STRUCT_SIZE = 152  # struct sigaction on x86_64 Linux
+                    _SIG_DFL_CONST = 0
+
+                    # Pre-build the default sigaction struct in the parent
+                    _sa_default_buf = _ctypes.create_string_buffer(_SA_STRUCT_SIZE)
+                    _ctypes.memmove(_sa_default_buf, _ctypes.c_void_p(_SIG_DFL_CONST), 8)
+
+                    # Register a fork handler that resets signal handlers in the child
+                    # immediately after fork(), before any other Python code runs.
+                    # This is the earliest possible hook after fork().
+                    _fork_handler_registered = [False]
+
+                    def _after_fork_in_child():
+                        """Reset Go runtime's signal handlers immediately after fork."""
+                        try:
+                            _libc.sigaction(_SIGSEGV_CONST, _sa_default_buf, None)
+                            _libc.sigaction(_SIGBUS_CONST, _sa_default_buf, None)
+                            _libc.signal(_SIGSEGV_CONST, _SIG_DFL_CONST)
+                            _libc.signal(_SIGBUS_CONST, _SIG_DFL_CONST)
+                        except Exception:
+                            pass  # Best effort - don't crash the child if this fails
+
+                    if not _fork_handler_registered[0]:
+                        _child_os.register_at_fork(after_in_child=_after_fork_in_child)
+                        _fork_handler_registered[0] = True
+                        logger.info("[DEBUG dist_ckpt.save] step 4e-write: registered after_fork_in_child signal reset handler")
+
+                    # Child wrapper still does signal reset as belt-and-suspenders
+                    # (in case register_at_fork didn't fully work)
                     def _child_target_wrapper(original_fn, **kwargs):
-                        import os as _os
-                        _pid = _os.getpid()
-                        # Write directly to fd 2 (stderr) to bypass Python logging/buffering
-                        _os.write(2, f"[child pid={_pid}] _child_target_wrapper ENTERED\n".encode())
+                        _pid = _child_os.getpid()
+                        _child_os.write(2, f"[child pid={_pid}] _child_target_wrapper ENTERED\n".encode())
 
                         try:
-                            import ctypes
-                            import ctypes.util
+                            # Signal handlers should already be reset by _after_fork_in_child,
+                            # but reset again as belt-and-suspenders.
+                            _libc.sigaction(_SIGSEGV_CONST, _sa_default_buf, None)
+                            _libc.sigaction(_SIGBUS_CONST, _sa_default_buf, None)
+                            _libc.signal(_SIGSEGV_CONST, _SIG_DFL_CONST)
+                            _libc.signal(_SIGBUS_CONST, _SIG_DFL_CONST)
 
-                            _SIGSEGV = 11
-                            _SIGBUS = 7
-
-                            _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-
-                            # Use sigaction to fully reset signal handlers (Go uses sigaction with
-                            # SA_SIGINFO | SA_ONSTACK flags that signal() may not fully override).
-                            _SA_STRUCT_SIZE = 152
-                            _SIG_DFL = 0
-
-                            # Build a default sigaction struct: handler=SIG_DFL, empty mask, flags=0
-                            _sa_default = ctypes.create_string_buffer(_SA_STRUCT_SIZE)
-                            ctypes.memmove(_sa_default, ctypes.c_void_p(_SIG_DFL), 8)
-
-                            _libc.sigaction(_SIGSEGV, _sa_default, None)
-                            _libc.sigaction(_SIGBUS, _sa_default, None)
-                            _libc.signal(_SIGSEGV, _SIG_DFL)
-                            _libc.signal(_SIGBUS, _SIG_DFL)
-
-                            _os.write(2, f"[child pid={_pid}] signal handlers reset, calling original_fn\n".encode())
+                            _child_os.write(2, f"[child pid={_pid}] signal handlers reset, calling original_fn\n".encode())
                             result = original_fn(**kwargs)
-                            _os.write(2, f"[child pid={_pid}] original_fn completed successfully\n".encode())
+                            _child_os.write(2, f"[child pid={_pid}] original_fn completed successfully\n".encode())
                             return result
                         except Exception as _e:
-                            _os.write(2, f"[child pid={_pid}] EXCEPTION in child: {_e}\n".encode())
+                            _child_os.write(2, f"[child pid={_pid}] EXCEPTION in child: {_e}\n".encode())
                             import traceback as _tb
-                            _os.write(2, f"[child pid={_pid}] {_tb.format_exc()}\n".encode())
+                            _child_os.write(2, f"[child pid={_pid}] {_tb.format_exc()}\n".encode())
                             raise
 
                     if _write_buckets:
