@@ -1029,9 +1029,49 @@ def save(
                             _libc.sigaction(_SIGBUS, _sa_old_bus, None)
                             logger.info("[DEBUG dist_ckpt.save] step 4e-write: parent SIGSEGV/SIGBUS restored after fork")
 
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all processes started, joining count_queue")
-                            _count_queue.join()
-                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: count_queue joined, collecting results")
+                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all processes started, waiting for completion")
+                            # Poll for completion instead of count_queue.join() which blocks forever
+                            # if a child dies (e.g. SIGSEGV with SIG_DFL kills process silently).
+                            import time as _time_mod
+                            _POLL_INTERVAL = 2.0
+                            _MAX_WAIT = 1200  # 20 minutes max
+                            _wait_start = _time_mod.time()
+                            _all_done = False
+                            while not _all_done:
+                                # Check if all children are still alive
+                                _dead_children = []
+                                for _pi2, _p2 in enumerate(_p_list):
+                                    if not _p2.is_alive() and _p2.exitcode is not None:
+                                        if _p2.exitcode != 0:
+                                            _dead_children.append((_pi2, _p2.exitcode))
+                                if _dead_children:
+                                    for _dc_idx, _dc_exit in _dead_children:
+                                        logger.error(
+                                            f"[DEBUG dist_ckpt.save] step 4e-write: child process {_dc_idx} "
+                                            f"(pid={_p_list[_dc_idx].pid}) DIED with exit code {_dc_exit} "
+                                            f"(signal {-_dc_exit if _dc_exit < 0 else 'N/A'})"
+                                        )
+                                    raise RuntimeError(
+                                        f"Checkpoint write child process(es) died: "
+                                        f"{[(idx, code) for idx, code in _dead_children]}"
+                                    )
+                                # Try non-blocking join on the count_queue
+                                # All tasks done = unfinished_tasks == 0
+                                if _count_queue._unfinished_tasks._semlock._get_value() == 0:  # type: ignore
+                                    _all_done = True
+                                    break
+                                if _time_mod.time() - _wait_start > _MAX_WAIT:
+                                    # Log status of all children
+                                    for _pi2, _p2 in enumerate(_p_list):
+                                        logger.error(
+                                            f"[DEBUG dist_ckpt.save] step 4e-write: timeout - child {_pi2} "
+                                            f"alive={_p2.is_alive()}, exitcode={_p2.exitcode}"
+                                        )
+                                    raise RuntimeError(
+                                        f"Checkpoint write timed out after {_MAX_WAIT}s waiting for child processes"
+                                    )
+                                _time_mod.sleep(_POLL_INTERVAL)
+                            logger.info("[DEBUG dist_ckpt.save] step 4e-write: all children completed, collecting results")
 
                             for _proc_idx in range(len(_write_buckets)):
                                 _local_proc_idx, _local_results_or_exc = _local_results_queue.get()
