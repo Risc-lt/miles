@@ -926,6 +926,26 @@ def save(
 
                     logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: rank={_write_rank}, num_buckets={len(_write_buckets) if _write_buckets else 0}")
 
+                    # Wrapper to reset Go runtime's SIGSEGV handler in the forked child.
+                    # fork() inherits the parent's signal handlers, including the Go runtime's
+                    # runtime.sigfwd installed by mooncake TransferEngine. This causes segfault
+                    # in the child when it accesses any memory that triggers the inherited handler.
+                    # We must use ctypes to reset at the C level since Python's signal.signal()
+                    # only affects the Python-level handler, not the C-level sigaction installed by Go.
+                    def _child_target_wrapper(original_fn, **kwargs):
+                        import ctypes
+                        import ctypes.util
+                        # Reset SIGSEGV and SIGBUS to SIG_DFL at the C level
+                        # This overrides the Go runtime's sigaction handler
+                        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+                        _SIG_DFL = 0
+                        _SIGSEGV = 11
+                        _SIGBUS = 7
+                        # signal(signum, handler) - simpler than sigaction for just resetting to default
+                        _libc.signal(_SIGSEGV, _SIG_DFL)
+                        _libc.signal(_SIGBUS, _SIG_DFL)
+                        return original_fn(**kwargs)
+
                     if _write_buckets:
                         _gc_was_enabled = _gc.isenabled()
                         if _gc_was_enabled:
@@ -938,7 +958,7 @@ def save(
                             _count_queue = _ctx.JoinableQueue()
                             _p_list = []
 
-                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: creating {len(_write_buckets)} fork processes")
+                            logger.info(f"[DEBUG dist_ckpt.save] step 4e-write: creating {len(_write_buckets)} fork processes (with signal reset)")
                             for _i, _write_bucket in enumerate(_write_buckets):
                                 _count_queue.put(_i)
                                 _kwargs = {
@@ -955,7 +975,10 @@ def save(
                                         _kwargs["use_msc"] = _use_msc
                                 _p_list.append(
                                     _ctx.Process(
-                                        target=_partial(_FSWA.write_preloaded_data, _transform_list),
+                                        target=_partial(
+                                            _child_target_wrapper,
+                                            _partial(_FSWA.write_preloaded_data, _transform_list),
+                                        ),
                                         kwargs=_kwargs,
                                     )
                                 )
