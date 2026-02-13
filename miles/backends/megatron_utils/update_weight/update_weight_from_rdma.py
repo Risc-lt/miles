@@ -193,6 +193,29 @@ class StreamingTransferManager:
         self.reg_thread = None
         self._bundles = []
 
+    def wait_transfers_only(self) -> None:
+        """Wait for all transfers to complete WITHOUT deregistering or shutting down.
+
+        Used with persistent registration: memory stays registered and the
+        executor stays alive so the next iteration can reuse them.
+        """
+        # Ensure registration thread finished
+        if self.reg_thread is not None:
+            self.reg_thread.join(timeout=60.0)
+            if self.reg_thread.is_alive():
+                logger.error("[RDMA] Registration thread did not complete in time")
+
+        # Wait for all transfer futures
+        for future in self.transfer_futures:
+            try:
+                future.result(timeout=30.0)
+            except Exception as e:
+                logger.error(f"[RDMA] Transfer future failed: {e}")
+
+        self.transfer_futures.clear()
+        # NOTE: We intentionally do NOT deregister memory, shutdown executor,
+        # or clear _bundles — they persist for the next iteration.
+
     def reset(self) -> None:
         """Reset for next update cycle."""
         self.registration_complete.clear()
@@ -566,9 +589,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 self.transfer_manager.wait_and_cleanup()
                 logger.info("[RDMA] All transfers complete and memory deregistered")
 
-            # Reset bundle state for next cycle
-            for transfer_bundle in self.engines.values():
-                transfer_bundle.reset()
+        # Reset bundle state for next cycle (clears _update_pending shard counters)
+        for transfer_bundle in self.engines.values():
+            transfer_bundle.reset()
 
         if not self.persistent_registration:
             # Offload model replicas from memory after transfer
