@@ -470,6 +470,8 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             if tensor.device.type != "cuda":
                 raise RuntimeError(f"Local replica parameter {name} is not on CUDA device.")
         weight_memory_registry, registered_blocks = batch_register_memory_region(model_replica, transfer_engine)
+        # Mark registration done so wait_registration_done() won't block on the first update cycle
+        self.executable_queue._registration_done.set()
 
         logger.info(
             f"[RDMA] Registered {len(list(model_replica.named_parameters()))} tensors from replica with transfer engine."
