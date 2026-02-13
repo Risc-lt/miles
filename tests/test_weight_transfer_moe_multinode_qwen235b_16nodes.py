@@ -32,7 +32,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     num_train_gpus: int = 8 * GPUS_PER_NODE  # 8 nodes * 8 GPUs
     num_rollout_gpus: int = 64  # 8 nodes * 8 GPUs for rollout
     # Optimizations
-    pipelined_transfer: bool = False
+    pipelined_transfer: bool = False  # Legacy field, pipelining is always on for RDMA
     # Profiling
     use_pytorch_profiler_update_weight: bool = False
     # multi-node settings
@@ -211,7 +211,7 @@ def execute(args: ScriptArgs):
         sglang_args += "--sglang-enable-dp-attention "
     mem = (
         int(args.bucket_size * 1024 * 1024 * 1024)
-        if args.pipelined_transfer and args.mode == "rdma"
+        if args.mode == "rdma"
         else (4 * 1024 * 1024 * 1024)
     )
     # ci_args = "--ci-test "
