@@ -27,8 +27,8 @@ from .update_weight_from_remote import UpdateWeightFromRemote
 logger = logging.getLogger(__name__)
 
 
-def batch_register_memory_region(model, transfer_engine):
-    """Like register_memory_region_v2, but uses batch_register_memory (C++ parallel)."""
+def prepare_memory_region(model):
+    """Build weight_mr_dict and merged memory blocks from model parameters (CUDA metadata only, no RDMA)."""
     weight_mr_dict = {}
     weight_addr_set = set()
     for name, weight in model.named_parameters():
@@ -55,6 +55,14 @@ def batch_register_memory_region(model, transfer_engine):
                     current_block = (address, size)
         if current_block is not None:
             merged_blocks.append(current_block)
+
+    logger.info(f"[RDMA] prepare_memory_region: built {len(merged_blocks)} merged blocks from {len(weight_mr_dict)} params")
+    return weight_mr_dict, merged_blocks
+
+
+def batch_register_memory_region(model, transfer_engine):
+    """Like register_memory_region_v2, but uses batch_register_memory (C++ parallel)."""
+    weight_mr_dict, merged_blocks = prepare_memory_region(model)
 
     addrs = [addr for addr, _ in merged_blocks]
     sizes = [size for _, size in merged_blocks]
@@ -91,6 +99,15 @@ class TransferTask:
     engine: TransferEngine
 
 
+@dataclasses.dataclass
+class RegistrationTask:
+    """Represents a queued RDMA memory registration task."""
+
+    addrs: list[int]
+    sizes: list[int]
+    engine: TransferEngine
+
+
 class ExecutableQueue:
     """
     Asynchronous queue for executing transfer_bundle.execute_each() operations.
@@ -106,25 +123,38 @@ class ExecutableQueue:
         self._shutdown_event = threading.Event()
         self._tasks_completed = threading.Event()
         self._enqueue_complete = threading.Event()
+        self._registration_done = threading.Event()
         self._sync_error_lock = threading.Lock()
         self._sync_error = None
 
     def _background_worker(self):
-        """Background thread worker that processes queued transfer tasks."""
+        """Background thread worker that processes queued tasks (registration and transfer)."""
         pending_batches: dict[TransferEngine, list[int]] = {}
 
         while not self._shutdown_event.is_set():
             # Try to get and process a task
             try:
                 task = self._queue.get(timeout=0.1)
-                logger.info(f"[RDMA] Submitting transfer task for session {task.session_id}...")
-                batch_id = task.engine.batch_transfer_async_write(
-                    task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
-                )
-                if task.engine not in pending_batches:
-                    pending_batches[task.engine] = []
-                pending_batches[task.engine].append(batch_id)
-                self._queue.task_done()
+                if isinstance(task, RegistrationTask):
+                    logger.info(f"[RDMA] Executing batch_register_memory for {len(task.addrs)} blocks...")
+                    ret = task.engine.batch_register_memory(task.addrs, task.sizes)
+                    if ret != 0:
+                        with self._sync_error_lock:
+                            self._sync_error = f"batch_register_memory failed, error: {ret}"
+                        logger.error(f"[RDMA] {self._sync_error}")
+                    else:
+                        logger.info("[RDMA] batch_register_memory completed successfully")
+                    self._registration_done.set()
+                    self._queue.task_done()
+                elif isinstance(task, TransferTask):
+                    logger.info(f"[RDMA] Submitting transfer task for session {task.session_id}...")
+                    batch_id = task.engine.batch_transfer_async_write(
+                        task.session_id, task.source_ptrs, task.target_ptrs, task.source_lens
+                    )
+                    if task.engine not in pending_batches:
+                        pending_batches[task.engine] = []
+                    pending_batches[task.engine].append(batch_id)
+                    self._queue.task_done()
             except queue.Empty:
                 pass
 
@@ -162,14 +192,26 @@ class ExecutableQueue:
             self._sync_error = None
         self._enqueue_complete.clear()
         self._tasks_completed.clear()
+        self._registration_done.clear()
 
     def mark_enqueue_complete(self):
         """Signal that main thread is done enqueueing tasks."""
         self._enqueue_complete.set()
 
-    def enqueue_task(self, task: TransferTask):
-        """Add a transfer task to the queue."""
+    def enqueue_task(self, task: TransferTask | RegistrationTask):
+        """Add a transfer or registration task to the queue."""
         self._queue.put(task)
+
+    def wait_registration_done(self, timeout=60.0):
+        """Wait for registration task to complete."""
+        if not self._registration_done.wait(timeout):
+            logger.error("[RDMA] Timeout waiting for batch_register_memory to complete")
+            return False
+        with self._sync_error_lock:
+            if self._sync_error:
+                logger.error(f"[RDMA] Registration error: {self._sync_error}")
+                return False
+        return True
 
     def wait_all_complete(self, timeout=30.0):
         """Wait for all queued tasks to complete."""
@@ -482,13 +524,15 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 for weight in transfer_bundle.model_replica.parameters():
                     weight.untyped_storage().resize_(weight.numel() * weight.element_size())
                 transfer_bundle._offloaded = False
-                # RDMA: register_memory — register the reallocated memory with transfer engine
-                transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
-                    self._register_replica_memory(
-                        transfer_bundle.model_replica,
-                        transfer_bundle.remote_weight_infos[0].weights_info,
-                        transfer_bundle.engine,
-                    )
+                # CUDA: build metadata (needs memory_snapshot on main thread)
+                weight_mr_dict, merged_blocks = prepare_memory_region(transfer_bundle.model_replica)
+                transfer_bundle.weight_memory_registry = weight_mr_dict
+                transfer_bundle.registered_blocks = merged_blocks
+                # RDMA: enqueue async registration on background thread
+                addrs = [addr for addr, _ in merged_blocks]
+                sizes = [size for _, size in merged_blocks]
+                self.executable_queue.enqueue_task(
+                    RegistrationTask(addrs=addrs, sizes=sizes, engine=transfer_bundle.engine)
                 )
 
     def leader_post_update(self) -> None:
@@ -517,8 +561,10 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
             if self.pipelined_transfer:
-                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads the source addresses. 
+                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads the source addresses.
                 torch.cuda.synchronize()
+                # Wait for async registration to complete before first transfer
+                self.executable_queue.wait_registration_done()
                 # Use executable queue for async transfer operations
                 transfer_bundle.execute_each(transfer_ready_params, self.executable_queue)
 
