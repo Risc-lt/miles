@@ -37,9 +37,7 @@ class Timer(metaclass=SingletonMeta):
         if rank == 0:
             if log_info:
                 logger.info(f"Timer {name} end (elapsed: {elapsed_time:.1f}s)")
-            log_path = f"{LOGFILE}_{rank}.log"
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "a") as f:
+            with open(f"{LOGFILE}_{rank}.log", "a") as f:
                 f.write(f"Timer {name} end (elapsed: {elapsed_time*1000:.3f}ms)\n")
 
     def reset(self, name=None):
@@ -71,9 +69,7 @@ class Timer(metaclass=SingletonMeta):
                 f"{separator_line}\n\n"
             )
 
-            log_path = f"{LOGFILE}_{rank}.log"
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, "a") as f:
+            with open(f"{LOGFILE}_{rank}.log", "a") as f:
                 f.write(log_content)
 
     @contextmanager
