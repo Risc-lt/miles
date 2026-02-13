@@ -239,18 +239,19 @@ def execute(args: ScriptArgs):
         misc_args += "--update-weight-transfer-mode rdma "
 
     profile_args = ""
+    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
     if bool(args.use_pytorch_profiler_update_weight):
         profile_args += (
             "--use-pytorch-profiler-update-weight "
             "--profile-update-weight-start 2 "
             "--profile-update-weight-end 3 "
-            "--tensorboard-dir /root/profiler_logs/ "
+            f"--tensorboard-dir {log_dir}/profiler_logs/ "
         )
     profile_args += (
         "--use-pytorch-profiler-update-weight "
         "--profile-update-weight-start 2 "
         "--profile-update-weight-end 3 "
-        f"--tensorboard-dir /root/new_{args.mode}_profiler_logs/ "
+        f"--tensorboard-dir {log_dir}/new_{args.mode}_profiler_logs/ "
     )
     train_args = (
         f"{ckpt_args} "
@@ -283,6 +284,7 @@ def execute(args: ScriptArgs):
             "NCCL_NVLS_ENABLE": (
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
+            **({"MILES_LOG_DIR": os.environ["MILES_LOG_DIR"]} if "MILES_LOG_DIR" in os.environ else {}),
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,

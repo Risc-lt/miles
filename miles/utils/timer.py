@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import contextmanager
 from datetime import datetime
 from functools import wraps
@@ -12,7 +13,8 @@ __all__ = ["Timer", "timer", "log_experiment_start"]
 
 logger = logging.getLogger(__name__)
 
-LOGFILE = "miles_timer"
+_log_dir = os.environ.get("MILES_LOG_DIR", "")
+LOGFILE = os.path.join(_log_dir, "miles_timer") if _log_dir else "miles_timer"
 
 
 class Timer(metaclass=SingletonMeta):
