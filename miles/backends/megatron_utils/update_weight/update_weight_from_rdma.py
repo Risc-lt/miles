@@ -175,14 +175,22 @@ class StreamingTransferManager:
 
         self.transfer_futures.clear()
 
-        # Batch deregister all bundles
+        # Batch deregister all bundles in parallel (each bundle has its own engine)
+        def _deregister_bundle(bundle):
+            if bundle.registered_blocks:
+                ptrs = [addr for addr, _ in bundle.registered_blocks]
+                bundle.engine.batch_unregister_memory(ptrs)
+                logger.info(f"[RDMA] Batch unregistered {len(ptrs)} memory blocks")
+                bundle.registered_blocks = []
+
         with timer("rdma_batch_deregistration"):
-            for bundle in self._bundles:
-                if bundle.registered_blocks:
-                    ptrs = [addr for addr, _ in bundle.registered_blocks]
-                    bundle.engine.batch_unregister_memory(ptrs)
-                    logger.info(f"[RDMA] Batch unregistered {len(ptrs)} memory blocks")
-                    bundle.registered_blocks = []
+            bundles_to_dereg = [b for b in self._bundles if b.registered_blocks]
+            if len(bundles_to_dereg) > 1:
+                with ThreadPoolExecutor(max_workers=len(bundles_to_dereg)) as dereg_pool:
+                    list(dereg_pool.map(_deregister_bundle, bundles_to_dereg))
+            else:
+                for b in bundles_to_dereg:
+                    _deregister_bundle(b)
 
         # Shutdown executor
         if self.executor is not None:
@@ -573,11 +581,19 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             for transfer_bundle in self.engines.values():
                 transfer_bundle.execute_all()
             if not self.persistent_registration:
-                # Deregister and offload
-                for transfer_bundle in self.engines.values():
-                    if transfer_bundle.registered_blocks:
-                        self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
-                        transfer_bundle.registered_blocks = []
+                # Deregister in parallel across bundles
+                def _dereg(bundle):
+                    if bundle.registered_blocks:
+                        self._unregister_replica_memory(bundle.registered_blocks, bundle.engine)
+                        bundle.registered_blocks = []
+
+                bundles = [b for b in self.engines.values() if b.registered_blocks]
+                if len(bundles) > 1:
+                    with ThreadPoolExecutor(max_workers=len(bundles)) as dereg_pool:
+                        list(dereg_pool.map(_dereg, bundles))
+                else:
+                    for b in bundles:
+                        _dereg(b)
         else:
             # Pipelined: wait for streaming transfers to complete and cleanup
             logger.info("[RDMA] Waiting for all streaming transfers to complete...")
