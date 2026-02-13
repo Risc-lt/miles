@@ -84,10 +84,10 @@ class StreamingTransferManager:
         def do_registration():
             try:
                 with timer("rdma_batch_registration"):
-                    for bundle in bundles:
-                        bundle.weight_memory_registry, bundle.registered_blocks = register_memory_region_v2(
-                            bundle.model_replica, bundle.engine
-                        )
+                    with ThreadPoolExecutor(max_workers=len(bundles)) as reg_pool:
+                        futures = [reg_pool.submit(register_memory_region_v2, b.model_replica, b.engine) for b in bundles]
+                        for bundle, future in zip(bundles, futures):
+                            bundle.weight_memory_registry, bundle.registered_blocks = future.result()
                         logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors for engine rank")
             except Exception as e:
                 logger.error(f"[RDMA] Registration failed: {e}")
@@ -310,6 +310,8 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         self._offloaded = False
         self.pipelined_transfer = args.rdma_pipelined_transfer
+        self.persistent_registration = getattr(args, "rdma_persistent_registration", False)
+        self._registered = False  # Track whether persistent registration has been done
 
         # Initialize streaming transfer manager for pipelined transfers
         num_workers = getattr(args, "rdma_transfer_workers", 4)
@@ -460,8 +462,16 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         Hook called at start of weight transfer cycle.
         Re-onloads model replicas if offloaded and starts background registration.
         Registration runs parallel to main thread's all-gather operations.
+
+        With persistent_registration=True, registration is done once and kept across
+        iterations — skipping re-onload, re-registration, and later deregistration/offload.
         """
         if not self._is_source:
+            return
+
+        # Persistent registration: skip if already registered from a previous iteration
+        if self.persistent_registration and self._registered:
+            logger.info("[RDMA] Persistent registration: skipping re-registration (already registered)")
             return
 
         bundles_to_register = []
@@ -485,6 +495,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                     bundle.model_replica, bundle.engine
                 )
                 logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors synchronously")
+
+        if self.persistent_registration:
+            self._registered = True
 
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
@@ -523,8 +536,11 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         In pipelined mode:
         - Wait for registration thread to complete
         - Wait for all transfer futures in threadpool
-        - Batch deregister all memory regions
-        - Offload model replicas
+        - Batch deregister all memory regions (unless persistent)
+        - Offload model replicas (unless persistent)
+
+        With persistent_registration=True, memory stays registered and replicas
+        stay on GPU for the next iteration.
         """
         if not self._is_source:
             return
@@ -533,35 +549,44 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             # Non-pipelined: execute all transfers synchronously
             for transfer_bundle in self.engines.values():
                 transfer_bundle.execute_all()
-            # Deregister and offload
-            for transfer_bundle in self.engines.values():
-                if transfer_bundle.registered_blocks:
-                    self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
-                    transfer_bundle.registered_blocks = []
+            if not self.persistent_registration:
+                # Deregister and offload
+                for transfer_bundle in self.engines.values():
+                    if transfer_bundle.registered_blocks:
+                        self._unregister_replica_memory(transfer_bundle.registered_blocks, transfer_bundle.engine)
+                        transfer_bundle.registered_blocks = []
         else:
             # Pipelined: wait for streaming transfers to complete and cleanup
             logger.info("[RDMA] Waiting for all streaming transfers to complete...")
-            self.transfer_manager.wait_and_cleanup()
-            logger.info("[RDMA] All transfers complete and memory deregistered")
+            if self.persistent_registration:
+                # Wait for transfers but skip deregistration
+                self.transfer_manager.wait_transfers_only()
+                logger.info("[RDMA] All transfers complete (persistent: keeping registration)")
+            else:
+                self.transfer_manager.wait_and_cleanup()
+                logger.info("[RDMA] All transfers complete and memory deregistered")
 
             # Reset bundle state for next cycle
             for transfer_bundle in self.engines.values():
                 transfer_bundle.reset()
 
-        # Offload model replicas from memory after transfer
-        print_memory("[RDMA] Before offloading model replica")
-        for transfer_bundle in self.engines.values():
-            if not transfer_bundle._offloaded:
-                # Release GPU memory
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(0)
-                transfer_bundle._offloaded = True
+        if not self.persistent_registration:
+            # Offload model replicas from memory after transfer
+            print_memory("[RDMA] Before offloading model replica")
+            for transfer_bundle in self.engines.values():
+                if not transfer_bundle._offloaded:
+                    # Release GPU memory
+                    for weight in transfer_bundle.model_replica.parameters():
+                        weight.untyped_storage().resize_(0)
+                    transfer_bundle._offloaded = True
 
-        torch.cuda.empty_cache()
-        print_memory("[RDMA] After offloading model replica")
+            torch.cuda.empty_cache()
+            print_memory("[RDMA] After offloading model replica")
+        else:
+            logger.info("[RDMA] Persistent registration: skipping offload (replicas stay on GPU)")
 
         # Reset transfer manager state for next cycle
-        if self.pipelined_transfer:
+        if self.pipelined_transfer and not self.persistent_registration:
             self.transfer_manager.reset()
 
         return

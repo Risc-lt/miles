@@ -240,18 +240,11 @@ def execute(args: ScriptArgs):
 
     profile_args = ""
     log_dir = os.environ.get("MILES_LOG_DIR", "/root")
-    if bool(args.use_pytorch_profiler_update_weight):
-        profile_args += (
-            "--use-pytorch-profiler-update-weight "
-            "--profile-update-weight-start 2 "
-            "--profile-update-weight-end 3 "
-            f"--tensorboard-dir {log_dir}/profiler_logs/ "
-        )
     profile_args += (
         "--use-pytorch-profiler-update-weight "
         "--profile-update-weight-start 2 "
         "--profile-update-weight-end 3 "
-        f"--tensorboard-dir {log_dir}/new_{args.mode}_profiler_logs/ "
+        f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
     )
     train_args = (
         f"{ckpt_args} "

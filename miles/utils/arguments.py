@@ -185,6 +185,13 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 help="Whether to use pipelined transfer when using RDMA for weight transfer.",
             )
+            parser.add_argument(
+                "--rdma-persistent-registration",
+                action="store_true",
+                help="Keep RDMA memory regions registered and model replicas on GPU across "
+                "weight update iterations, avoiding re-registration/deregistration overhead. "
+                "Trades ~14GB GPU memory per source rank for faster iterations.",
+            )
 
             return parser
 
