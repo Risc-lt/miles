@@ -214,9 +214,6 @@ def execute(args: ScriptArgs):
         if args.pipelined_transfer and args.mode == "rdma"
         else (4 * 1024 * 1024 * 1024)
     )
-    if args.pipelined_transfer and args.mode == "rdma":
-        sglang_args += "--rdma-pipelined-transfer "
-
     # ci_args = "--ci-test "
 
     misc_args = (

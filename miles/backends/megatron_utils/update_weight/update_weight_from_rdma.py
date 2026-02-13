@@ -1,6 +1,7 @@
 import dataclasses
 import logging
 import threading
+import time
 from argparse import Namespace
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -16,7 +17,6 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import ParallelismContext, RankParallelismConfig
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.parameter_mapper import ParameterMapper
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import register_memory_region_v2
 from sglang.srt.server_args import ServerArgs
 from tqdm import tqdm
 
@@ -29,35 +29,56 @@ logger = logging.getLogger(__name__)
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
-    # Reconstruct Sglang ServerArgs from sglang Http query.
     valid_fields = {f.name for f in dataclasses.fields(ServerArgs)}
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
     return ServerArgs(**filtered_data)
 
 
+def register_cpu_memory_region(cpu_params_dict: dict, transfer_engine: TransferEngine):
+    """Register CPU pinned memory with the transfer engine.
+
+    Host ibv_reg_mr does not go through nvidia-peermem and is significantly
+    faster than GPU registration (~0.5-1s vs ~14.5s).
+    """
+    start_tic = time.time()
+    weight_mr_dict = {}
+    registered_blocks = []
+
+    for name, cpu_tensor in cpu_params_dict.items():
+        addr = cpu_tensor.data_ptr()
+        size = cpu_tensor.numel() * cpu_tensor.element_size()
+        ret = transfer_engine.register_memory(addr, size)
+        if ret != 0:
+            raise RuntimeError(f"register CPU memory failed for weight {name}, error: {ret}")
+        weight_mr_dict[name] = (addr, cpu_tensor.numel(), cpu_tensor.element_size())
+        registered_blocks.append((addr, size))
+
+    elapsed = time.time() - start_tic
+    logger.info(f"[RDMA] Registered {len(weight_mr_dict)} CPU tensors in {elapsed:.2f}s")
+    return weight_mr_dict, registered_blocks
+
+
 @dataclasses.dataclass
 class RemoteWeightInfo:
-    # Remote session and weight registration info.
     session_id: str
     weights_info: dict[str, tuple[int, int, int]]  # name -> (remote_address, numel, element_size)
 
 
 @dataclasses.dataclass
 class TransferTask:
-    """Represents a transfer task for the threadpool."""
-
     bundle: "TransferBundle"
     names: list[str]
 
 
 class StreamingTransferManager:
-    """
-    Manages streaming RDMA transfers with parallel registration.
+    """Manages pipelined RDMA transfers through CPU pinned memory.
 
-    - Registration runs in background thread parallel to main thread's all-gather
-    - Transfers stream to threadpool as tensors become ready
-    - Uses blocking sync transfers (simpler, threadpool provides parallelism)
-    - Batch deregistration at end for efficiency
+    Pipeline per bucket:
+      Main thread:  all-gather → load_weights(GPU) → cuda.sync → submit ──→ next bucket
+      Background:                                                   ↘ D2H copy → RDMA write
+
+    CPU registration runs in background on first iteration, parallel to all-gather.
+    Registration persists across iterations (host MR is cheap).
     """
 
     def __init__(self, num_workers: int = 4):
@@ -71,10 +92,7 @@ class StreamingTransferManager:
         self._bundles: list[TransferBundle] = []
 
     def start_registration(self, bundles: list["TransferBundle"]) -> None:
-        """
-        Start batch registration in background thread - call at start of update cycle.
-        Runs parallel to main thread's all-gather operations.
-        """
+        """Start CPU memory registration in background, parallel to all-gather."""
         self._bundles = bundles
         self.registration_complete.clear()
         self.pending_queue.clear()
@@ -83,14 +101,20 @@ class StreamingTransferManager:
 
         def do_registration():
             try:
-                with timer("rdma_batch_registration"):
+                with timer("rdma_cpu_registration"):
                     with ThreadPoolExecutor(max_workers=len(bundles)) as reg_pool:
-                        futures = [reg_pool.submit(register_memory_region_v2, b.model_replica, b.engine) for b in bundles]
+                        futures = [
+                            reg_pool.submit(register_cpu_memory_region, b.cpu_params_dict, b.engine)
+                            for b in bundles
+                        ]
                         for bundle, future in zip(bundles, futures):
                             bundle.weight_memory_registry, bundle.registered_blocks = future.result()
-                        logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors for engine rank")
+                    logger.info(
+                        f"[RDMA] Registered {len(bundles[-1].weight_memory_registry)} CPU tensors across "
+                        f"{len(bundles)} bundles"
+                    )
             except Exception as e:
-                logger.error(f"[RDMA] Registration failed: {e}")
+                logger.error(f"[RDMA] CPU registration failed: {e}")
                 raise
             finally:
                 with self.queue_lock:
@@ -104,146 +128,95 @@ class StreamingTransferManager:
 
         self.reg_thread = threading.Thread(target=do_registration, daemon=True)
         self.reg_thread.start()
-        logger.info("[RDMA] Started background registration thread")
+        logger.info("[RDMA] Started background CPU registration thread")
 
     def submit_for_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """
-        Called after load_weights + cuda sync for a batch of tensors.
-        Streams to threadpool immediately if registration done, else queues.
-        """
+        """Submit a batch of ready tensors for D2H + RDMA transfer."""
         if not names:
             return
 
         with self.queue_lock:
             if self.registration_complete.is_set():
-                # Registration done - submit to threadpool immediately
                 future = self.executor.submit(self._do_transfer, bundle, names)
                 self.transfer_futures.append(future)
             else:
-                # Registration still running - queue for later
                 self.pending_queue.append(TransferTask(bundle=bundle, names=names))
 
     def _do_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """Blocking transfer - runs in threadpool worker."""
-        # Build source pointers and lengths
+        """GPU→CPU copy then RDMA write from CPU pinned memory. Runs in threadpool."""
+        gpu_params = bundle.params_dict
+        cpu_params = bundle.cpu_params_dict
         source_ptrs, source_lens = [], []
+        valid_names = []
+
         for name in names:
-            tensor_register = bundle.weight_memory_registry.get(name)
-            if tensor_register is None:
-                logger.warning(f"[RDMA] Parameter {name} not found in weight registry")
+            if name not in cpu_params or name not in gpu_params:
+                logger.warning(f"[RDMA] Parameter {name} not found in CPU/GPU params")
                 continue
-            data_ptr, numel, ele_size = tensor_register
+
+            # D2H copy: GPU replica → CPU pinned replica
+            cpu_params[name].copy_(gpu_params[name])
+
+            cpu_reg = bundle.weight_memory_registry.get(name)
+            if cpu_reg is None:
+                logger.warning(f"[RDMA] Parameter {name} not in CPU weight registry")
+                continue
+
+            data_ptr, numel, ele_size = cpu_reg
             source_ptrs.append(data_ptr)
             source_lens.append(numel * ele_size)
+            valid_names.append(name)
 
         if not source_ptrs:
             return
 
-        # Transfer to each remote session
         for remote_session in bundle.remote_weight_infos:
             session_id = remote_session.session_id
             remote_weights_info = remote_session.weights_info
 
             target_ptrs = []
-            for name in names:
+            for name in valid_names:
                 if name in remote_weights_info:
-                    target_ptrs.append(remote_weights_info[name][0])  # remote address
+                    target_ptrs.append(remote_weights_info[name][0])
 
             if len(target_ptrs) != len(source_ptrs):
                 logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
                 continue
 
-            # Use blocking sync write
             ret = bundle.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
             if ret < 0:
                 logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
-    def wait_and_cleanup(self) -> None:
-        """Wait for all transfers to complete, then batch deregister."""
-        # Ensure registration thread finished
+    def wait_transfers(self) -> None:
+        """Wait for all transfers to complete. Registration and CPU memory persist."""
         if self.reg_thread is not None:
             self.reg_thread.join(timeout=60.0)
             if self.reg_thread.is_alive():
                 logger.error("[RDMA] Registration thread did not complete in time")
 
-        # Wait for all transfer futures
         for future in self.transfer_futures:
             try:
                 future.result(timeout=30.0)
             except Exception as e:
                 logger.error(f"[RDMA] Transfer future failed: {e}")
 
-        self.transfer_futures.clear()
-
-        # Batch deregister all bundles in parallel (each bundle has its own engine)
-        def _deregister_bundle(bundle):
-            if bundle.registered_blocks:
-                ptrs = [addr for addr, _ in bundle.registered_blocks]
-                bundle.engine.batch_unregister_memory(ptrs)
-                logger.info(f"[RDMA] Batch unregistered {len(ptrs)} memory blocks")
-                bundle.registered_blocks = []
-
-        with timer("rdma_batch_deregistration"):
-            bundles_to_dereg = [b for b in self._bundles if b.registered_blocks]
-            if len(bundles_to_dereg) > 1:
-                with ThreadPoolExecutor(max_workers=len(bundles_to_dereg)) as dereg_pool:
-                    list(dereg_pool.map(_deregister_bundle, bundles_to_dereg))
-            else:
-                for b in bundles_to_dereg:
-                    _deregister_bundle(b)
-
-        # Shutdown executor
-        if self.executor is not None:
-            self.executor.shutdown(wait=False)
-            self.executor = None
-
-        # Reset state
-        self.reg_thread = None
-        self._bundles = []
-
-    def wait_transfers_only(self) -> None:
-        """Wait for all transfers to complete WITHOUT deregistering or shutting down.
-
-        Used with persistent registration: memory stays registered and the
-        executor stays alive so the next iteration can reuse them.
-        """
-        # Ensure registration thread finished
-        if self.reg_thread is not None:
-            self.reg_thread.join(timeout=60.0)
-            if self.reg_thread.is_alive():
-                logger.error("[RDMA] Registration thread did not complete in time")
-
-        # Wait for all transfer futures
-        for future in self.transfer_futures:
-            try:
-                future.result(timeout=30.0)
-            except Exception as e:
-                logger.error(f"[RDMA] Transfer future failed: {e}")
-
-        self.transfer_futures.clear()
-        # NOTE: We intentionally do NOT deregister memory, shutdown executor,
-        # or clear _bundles — they persist for the next iteration.
-
-    def reset(self) -> None:
-        """Reset for next update cycle."""
-        self.registration_complete.clear()
-        self.pending_queue.clear()
         self.transfer_futures.clear()
 
 
 @dataclasses.dataclass
 class TransferBundle:
-    model_replica: Sequence[torch.nn.Module]
+    model_replica: torch.nn.Module
     engine: TransferEngine
     remote_weight_infos: list[RemoteWeightInfo]
     param_mapper: ParameterMapper
-    # Weight memory registry: name -> (data_ptr, numel, element_size)
+    # CPU pinned mirror of GPU replica parameters — RDMA source
+    cpu_params_dict: dict = dataclasses.field(default_factory=dict)
+    # CPU weight memory registry: name -> (data_ptr, numel, element_size)
     weight_memory_registry: dict = dataclasses.field(default_factory=dict)
-    # Registered address after merge (list of (address, size) tuples)
+    # Registered CPU blocks: list of (address, size)
     registered_blocks: list = dataclasses.field(default_factory=list)
     _offloaded: bool = False
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
-    # Local buffer to check for parameter readiness before transfer
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
 
     @property
@@ -258,11 +231,19 @@ class TransferBundle:
     def add_remote_session(self, remote_info: RemoteWeightInfo) -> None:
         self.remote_weight_infos.append(remote_info)
 
+    def allocate_cpu_replica(self) -> None:
+        """Allocate CPU pinned memory mirroring the GPU model replica."""
+        self.cpu_params_dict = {}
+        for name, param in self.model_replica.named_parameters():
+            self.cpu_params_dict[name] = torch.empty_like(param, device="cpu").pin_memory()
+        total_bytes = sum(t.numel() * t.element_size() for t in self.cpu_params_dict.values())
+        logger.info(
+            f"[RDMA] Allocated CPU pinned replica: {len(self.cpu_params_dict)} params, "
+            f"{total_bytes / (1024**3):.2f} GB"
+        )
+
     def get_transfer_ready_params(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> list[str]:
-        """
-        Track which parameters are ready for transfer.
-        A parameter is ready when all its shards have been loaded.
-        """
+        """Track which parameters are ready (all shards loaded)."""
         transfer_ready_params = []
         for name, _ in converted_named_tensors:
             mapped_result = self.param_mapper.map(name)
@@ -291,34 +272,20 @@ class TransferBundle:
                     transfer_ready_params.append(mapped)
         return transfer_ready_params
 
-    def execute_all(self) -> None:
-        """Execute transfer for all parameters - used in non-pipelined mode."""
-        for remote_session in self.remote_weight_infos:
-            session_id, remote_weights_info = remote_session.session_id, remote_session.weights_info
-            source_ptrs, target_ptrs, source_lens = [], [], []
-            for name, tensor_register in self.weight_memory_registry.items():
-                data_ptr, numel, ele_size = tensor_register
-                source_ptrs.append(data_ptr)
-                target_ptrs.append(remote_weights_info[name][0])  # remote address
-                source_lens.append(numel * ele_size)
-
-            # Batch transfer weights through RDMA
-            ret = self.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-            if ret < 0:
-                raise RuntimeError(f"Batch transfer weights via RDMA failed with error code {ret}.")
-
 
 class UpdateWeightFromRDMA(UpdateWeightFromRemote):
-    """
-    Update weights from RDMA using Transfer Engine.
+    """RDMA weight transfer using CPU pinned memory as the transfer source.
 
-    Similar to UpdateWeightFromNCCL but uses P2P RDMA transfer engine for the underlying weight transfer. Workflow
-    consists of following steps:
-    1. Based off the transfer plan, query the target rollout engines for remote session and weight info during connect_rollout_engines.
-    2. Construct local model replica according to the plan and attach target session id and weight memory registry
-    2. Do TP-EP all-gather for bucketed weights on parameters needing transfer from local just as in NCCL case.
-    3. Convert the gathered HF tensor into target shape and register them with Engine.
-    4. Call engine to batch transfer weights for each transfer task.
+    Architecture:
+    - GPU model replica: used for load_weights (preserves all sglang model logic)
+    - CPU pinned replica: registered with RDMA, used as transfer source
+    - GPU replica is re-onloaded each iteration, offloaded after transfer
+    - CPU replica + host MR registration persist across iterations (cheap)
+
+    Per-iteration pipeline:
+      on_transfer_start:  re-onload GPU replica (+ first-time CPU registration in background)
+      per bucket:         all-gather → load_weights(GPU) → sync → submit(D2H + RDMA)
+      finish:             wait all transfers → offload GPU replica → training resumes
     """
 
     def __init__(
@@ -339,27 +306,17 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             weight_update_mode="rdma",
         )
 
-        self._offloaded = False
-        self.pipelined_transfer = args.rdma_pipelined_transfer
-        self.persistent_registration = getattr(args, "rdma_persistent_registration", False)
-        self._registered = False  # Track whether persistent registration has been done
-
-        # Initialize streaming transfer manager for pipelined transfers
+        self._registered = False
         num_workers = getattr(args, "rdma_transfer_workers", 4)
         self.transfer_manager = StreamingTransferManager(num_workers=num_workers)
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
     ) -> None:
-        """
-        Initialize P2PTrainingTransferEngine if serves as a source.
-        """
-        # Store rollout engines and lock
         self.rollout_engines = rollout_engines
         self.rollout_engine_lock = rollout_engine_lock
 
         if self._is_source:
-            # Query Engine session and weight info from rollout instances according to the transfer plan
             self.remote_weight_infos_by_session_id = {}
             targets = self.transfer_plan.plan_p2p()
             targets_to_query = set((target.engine_ind, target.engine_rank) for target in targets)
@@ -377,22 +334,19 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 self.session_id_to_server_args[session_id] = create_server_args_from_dict(
                     ray.get(self.rollout_engines[engine_ind].get_server_info.remote())
                 )
-                assert (
-                    session_id is not None
-                ), f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
+                assert session_id is not None, (
+                    f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
+                )
                 logger.info(
                     f"[RDMA] Obtained remote {session_id} info from rollout engine {engine_ind} rank {engine_rank}"
                 )
                 logger.info(f"[RDMA] Remote weight info has {len(weights_info)} tensors.")
-                # logger.info(list(weights_info.keys()))
                 self.remote_weight_infos_by_session_id[session_id] = (weights_info, parallelism_info)
                 targets_to_session_id[(engine_ind, engine_rank)] = session_id
 
             print_memory("[RDMA] After obtaining remote weight info")
 
-            # Create local model replicas and transfer engines for each target rollout shard
             self.engines = {}
-            # Associate transfer tasks based on obtained session and weight info
             for target in targets:
                 session_id = targets_to_session_id[(target.engine_ind, target.engine_rank)]
                 remote_info = RemoteWeightInfo(session_id, self.remote_weight_infos_by_session_id[session_id][0])
@@ -407,52 +361,24 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                     )
                     param_mapper = ParameterMapper.from_model(model_replica)
                     print_memory(f"[RDMA] After model replica at {target.engine_rank}")
-                    # Note: Registration is deferred to on_transfer_start() for pipelining with all-gather
-                    self.engines[target.engine_rank] = TransferBundle(
+                    bundle = TransferBundle(
                         model_replica=model_replica,
                         engine=transfer_engine,
                         remote_weight_infos=[remote_info],
                         param_mapper=param_mapper,
                     )
+                    bundle.allocate_cpu_replica()
+                    self.engines[target.engine_rank] = bundle
                 else:
                     self.engines[target.engine_rank].add_remote_session(remote_info)
 
             print_memory("[RDMA] After Local Engine Replicas and engine Creation")
 
-    def _register_replica_memory(self, model_replica, remote_weight_info, transfer_engine):
-        # Verify the 1-to-1 mapping between local replica and remote weights expected.
-        for name, tensor in model_replica.named_parameters():
-            if name not in remote_weight_info:
-                raise RuntimeError(f"Local replica parameter {name} not found in remote replica.")
-            remote_numel, remote_ele_size = remote_weight_info[name][1], remote_weight_info[name][2]
-            if tensor.numel() != remote_numel or tensor.element_size() != remote_ele_size:
-                raise RuntimeError(
-                    f"Local replica parameter {name} numel {tensor.numel()} size {tensor.element_size()} does not match remote numel {remote_numel} size {remote_ele_size}."
-                )
-            if tensor.device.type != "cuda":
-                raise RuntimeError(f"Local replica parameter {name} is not on CUDA device.")
-        weight_memory_registry, registered_blocks = register_memory_region_v2(model_replica, transfer_engine)
-
-        logger.info(
-            f"[RDMA] Registered {len(list(model_replica.named_parameters()))} tensors from replica with transfer engine."
-        )
-        return weight_memory_registry, registered_blocks
-
-    def _unregister_replica_memory(self, registered_blocks, transfer_engine):
-        weight_blocks = []
-        for address, _ in registered_blocks:
-            weight_blocks.append(address)
-
-        transfer_engine.batch_unregister_memory(weight_blocks)
-        logger.info("[RDMA] Unregistered tensors from replica with transfer engine.")
-        return
-
     def _create_transfer_engine(self) -> TransferEngine:
         transfer_engine = TransferEngine()
         local_ip = ray._private.services.get_node_ip_address()
         transfer_engine.initialize(local_ip, "P2PHANDSHAKE", "rdma", "")
-
-        logger.info(f"[RDMA] Local replica Transfer Engine initialized at port {transfer_engine.get_rpc_port()}")
+        logger.info(f"[RDMA] Transfer Engine initialized at port {transfer_engine.get_rpc_port()}")
         return transfer_engine
 
     def _create_inference_replica(
@@ -479,153 +405,68 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
     def leader_post_update(self) -> None:
         ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
-        # Update weight version as we were write-only.
         ray.get(
             [
                 engine.update_weight_version.remote(weight_version=str(self.weight_version))
                 for engine in self.rollout_engines
             ]
         )
-        return
 
     def on_transfer_start(self) -> None:
-        """
-        Hook called at start of weight transfer cycle.
-        Re-onloads model replicas if offloaded and starts background registration.
-        Registration runs parallel to main thread's all-gather operations.
-
-        With persistent_registration=True, registration is done once and kept across
-        iterations — skipping re-onload, re-registration, and later deregistration/offload.
-        """
+        """Re-onload GPU replica for load_weights. First call also starts CPU registration."""
         if not self._is_source:
             return
 
-        # Persistent registration: skip if already registered from a previous iteration
-        if self.persistent_registration and self._registered:
-            logger.info("[RDMA] Persistent registration: skipping re-registration (already registered)")
-            return
-
-        bundles_to_register = []
+        # Re-onload GPU replicas (offloaded at end of previous iteration)
         for transfer_bundle in self.engines.values():
             if transfer_bundle._offloaded:
-                # Re-onload model replica - resize storage back to original size
                 for weight in transfer_bundle.model_replica.parameters():
                     weight.untyped_storage().resize_(weight.numel() * weight.element_size())
                 transfer_bundle._offloaded = False
-                logger.info("[RDMA] Re-onloaded model replica from offloaded state")
+                logger.info("[RDMA] Re-onloaded GPU replica for load_weights")
 
-            bundles_to_register.append(transfer_bundle)
-
-        if self.pipelined_transfer and bundles_to_register:
-            # Start registration in background thread - runs parallel to all-gather
-            self.transfer_manager.start_registration(bundles_to_register)
-        else:
-            # Non-pipelined: register synchronously
-            for bundle in bundles_to_register:
-                bundle.weight_memory_registry, bundle.registered_blocks = register_memory_region_v2(
-                    bundle.model_replica, bundle.engine
-                )
-                logger.info(f"[RDMA] Registered {len(bundle.weight_memory_registry)} tensors synchronously")
-
-        if self.persistent_registration:
+        # First iteration: register CPU memory in background parallel to all-gather
+        if not self._registered:
+            self.transfer_manager.start_registration(list(self.engines.values()))
             self._registered = True
 
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """
-        The RDMA P2P weight update is implemented as a single side write,
-        meaning the trainer writes its weights directly to the rollout engines' memory.
+        """Load weights into GPU replica, submit D2H + RDMA to background threads.
 
-        In pipelined mode:
-        - Registration runs in background thread (started by on_transfer_start)
-        - Transfers stream to threadpool as tensors become ready
-        - If registration not done yet, transfers queue and drain when ready
+        Critical path: all-gather → load_weights(GPU) → cuda.sync → submit → next bucket
+        Background:                                                    ↘ D2H copy → RDMA write
         """
         if not self._is_source or not converted_named_tensors:
             return
 
         for transfer_bundle in self.engines.values():
-            # Get list of parameters ready for transfer (all shards loaded)
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
-
-            # Load weights into model replica
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
-
-            if self.pipelined_transfer:
-                # Ensure load_weights async CUDA copies are flushed to GPU memory before RDMA reads
-                torch.cuda.synchronize()
-                # Submit to streaming transfer manager (queues if registration not done)
-                self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
+            torch.cuda.synchronize()
+            self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
 
         converted_named_tensors.clear()
 
     def finish_transfer_task(self) -> None:
-        """
-        Complete all pending transfers and clean up.
-
-        In pipelined mode:
-        - Wait for registration thread to complete
-        - Wait for all transfer futures in threadpool
-        - Batch deregister all memory regions (unless persistent)
-        - Offload model replicas (unless persistent)
-
-        With persistent_registration=True, memory stays registered and replicas
-        stay on GPU for the next iteration.
-        """
+        """Wait for all D2H + RDMA transfers, then offload GPU replica."""
         if not self._is_source:
             return
 
-        if not self.pipelined_transfer:
-            # Non-pipelined: execute all transfers synchronously
-            for transfer_bundle in self.engines.values():
-                transfer_bundle.execute_all()
-            if not self.persistent_registration:
-                # Deregister in parallel across bundles
-                def _dereg(bundle):
-                    if bundle.registered_blocks:
-                        self._unregister_replica_memory(bundle.registered_blocks, bundle.engine)
-                        bundle.registered_blocks = []
+        logger.info("[RDMA] Waiting for all D2H + RDMA transfers to complete...")
+        self.transfer_manager.wait_transfers()
+        logger.info("[RDMA] All transfers complete")
 
-                bundles = [b for b in self.engines.values() if b.registered_blocks]
-                if len(bundles) > 1:
-                    with ThreadPoolExecutor(max_workers=len(bundles)) as dereg_pool:
-                        list(dereg_pool.map(_dereg, bundles))
-                else:
-                    for b in bundles:
-                        _dereg(b)
-        else:
-            # Pipelined: wait for streaming transfers to complete and cleanup
-            logger.info("[RDMA] Waiting for all streaming transfers to complete...")
-            if self.persistent_registration:
-                # Wait for transfers but skip deregistration
-                self.transfer_manager.wait_transfers_only()
-                logger.info("[RDMA] All transfers complete (persistent: keeping registration)")
-            else:
-                self.transfer_manager.wait_and_cleanup()
-                logger.info("[RDMA] All transfers complete and memory deregistered")
-
-        # Reset bundle state for next cycle (clears _update_pending shard counters)
         for transfer_bundle in self.engines.values():
             transfer_bundle.reset()
 
-        if not self.persistent_registration:
-            # Offload model replicas from memory after transfer
-            print_memory("[RDMA] Before offloading model replica")
-            for transfer_bundle in self.engines.values():
-                if not transfer_bundle._offloaded:
-                    # Release GPU memory
-                    for weight in transfer_bundle.model_replica.parameters():
-                        weight.untyped_storage().resize_(0)
-                    transfer_bundle._offloaded = True
-
-            torch.cuda.empty_cache()
-            print_memory("[RDMA] After offloading model replica")
-        else:
-            logger.info("[RDMA] Persistent registration: skipping offload (replicas stay on GPU)")
-
-        # Reset transfer manager state for next cycle
-        if self.pipelined_transfer and not self.persistent_registration:
-            self.transfer_manager.reset()
-
-        return
+        # Offload GPU replica — CPU replica + registration persist
+        print_memory("[RDMA] Before offloading GPU replica")
+        for transfer_bundle in self.engines.values():
+            if not transfer_bundle._offloaded:
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.untyped_storage().resize_(0)
+                transfer_bundle._offloaded = True
+        torch.cuda.empty_cache()
+        print_memory("[RDMA] After offloading GPU replica")

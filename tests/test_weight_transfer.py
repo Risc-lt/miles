@@ -132,8 +132,6 @@ def execute(args: ScriptArgs):
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
-    if args.pipelined_transfer and args.mode == "rdma":
-        sglang_args += "--rdma-pipelined-transfer "
     # ci_args = "--ci-test "
 
     misc_args = (

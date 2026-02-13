@@ -181,16 +181,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 help="The method to transfer weights to remote rollout engines during update weight.",
             )
             parser.add_argument(
-                "--rdma-pipelined-transfer",
-                action="store_true",
-                help="Whether to use pipelined transfer when using RDMA for weight transfer.",
-            )
-            parser.add_argument(
-                "--rdma-persistent-registration",
-                action="store_true",
-                help="Keep RDMA memory regions registered and model replicas on GPU across "
-                "weight update iterations, avoiding re-registration/deregistration overhead. "
-                "Trades ~14GB GPU memory per source rank for faster iterations.",
+                "--rdma-transfer-workers",
+                type=int,
+                default=4,
+                help="Number of threadpool workers for pipelined D2H + RDMA transfers.",
             )
 
             return parser
