@@ -16,7 +16,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed.parallel_state import ParallelismContext, RankParallelismConfig
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.parameter_mapper import ParameterMapper
-from sglang.srt.model_loader.remote_instance_weight_loader_utils import register_memory_region_v2
+
 from sglang.srt.server_args import ServerArgs
 from tqdm import tqdm
 
@@ -25,6 +25,45 @@ from miles.utils.memory_utils import print_memory
 from .update_weight_from_remote import UpdateWeightFromRemote
 
 logger = logging.getLogger(__name__)
+
+
+def batch_register_memory_region(model, transfer_engine):
+    """Like register_memory_region_v2, but uses batch_register_memory (C++ parallel)."""
+    weight_mr_dict = {}
+    weight_addr_set = set()
+    for name, weight in model.named_parameters():
+        weight_mr_dict[name] = (weight.data_ptr(), weight.numel(), weight.element_size())
+        weight_addr_set.add(weight.data_ptr())
+
+    memory_snapshot = torch.cuda.memory.memory_snapshot()
+    merged_blocks = []
+    for segment in memory_snapshot:
+        current_block = None
+        for block in segment.get("blocks", []):
+            address = block.get("address", -1)
+            size = block.get("size", -1)
+            state = block.get("state", "")
+            if address < 0 or size < 0 or state == "":
+                continue
+            if state == "active_allocated" and address in weight_addr_set:
+                if current_block is None:
+                    current_block = (address, size)
+                elif current_block[0] + current_block[1] == address:
+                    current_block = (current_block[0], current_block[1] + size)
+                else:
+                    merged_blocks.append(current_block)
+                    current_block = (address, size)
+        if current_block is not None:
+            merged_blocks.append(current_block)
+
+    addrs = [addr for addr, _ in merged_blocks]
+    sizes = [size for _, size in merged_blocks]
+    ret = transfer_engine.batch_register_memory(addrs, sizes)
+    if ret != 0:
+        raise RuntimeError(f"batch_register_memory failed, error: {ret}")
+
+    logger.info(f"[RDMA] batch_register_memory: registered {len(merged_blocks)} merged blocks")
+    return weight_mr_dict, merged_blocks
 
 
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
@@ -388,7 +427,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 )
             if tensor.device.type != "cuda":
                 raise RuntimeError(f"Local replica parameter {name} is not on CUDA device.")
-        weight_memory_registry, registered_blocks = register_memory_region_v2(model_replica, transfer_engine)
+        weight_memory_registry, registered_blocks = batch_register_memory_region(model_replica, transfer_engine)
 
         logger.info(
             f"[RDMA] Registered {len(list(model_replica.named_parameters()))} tensors from replica with transfer engine."
@@ -434,6 +473,24 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         logger.info(f" Model {device}, params: {sum(p.numel() for p in model.parameters())} ")
         return model
 
+    def prepare_for_transfer(self) -> None:
+        if not self._is_source:
+            return
+        for transfer_bundle in self.engines.values():
+            if transfer_bundle._offloaded:
+                # CUDA: resize_() — reallocate GPU memory for replica
+                for weight in transfer_bundle.model_replica.parameters():
+                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
+                transfer_bundle._offloaded = False
+                # RDMA: register_memory — register the reallocated memory with transfer engine
+                transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
+                    self._register_replica_memory(
+                        transfer_bundle.model_replica,
+                        transfer_bundle.remote_weight_infos[0].weights_info,
+                        transfer_bundle.engine,
+                    )
+                )
+
     def leader_post_update(self) -> None:
         ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         # Update weight version as we were write-only.
@@ -457,18 +514,6 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         if not self._is_source or not converted_named_tensors:
             return
         for transfer_bundle in self.engines.values():
-            if transfer_bundle._offloaded:
-                # Realloc model replica on GPU since we don't need the last values
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
-                transfer_bundle._offloaded = False
-                transfer_bundle.weight_memory_registry, transfer_bundle.registered_blocks = (
-                    self._register_replica_memory(
-                        transfer_bundle.model_replica,
-                        transfer_bundle.remote_weight_infos[0].weights_info,
-                        transfer_bundle.engine,
-                    )
-                )
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
             if self.pipelined_transfer:

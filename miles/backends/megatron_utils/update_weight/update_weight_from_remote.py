@@ -100,6 +100,7 @@ class UpdateWeightFromRemote:
         dist.barrier(group=get_gloo_group())
 
         with timer("update_weights_implementation"):
+            self.prepare_for_transfer()
             # A single traversal through all parameters to update weights. Update happens first to the
             # non-expert weights, then to expert weights.
             non_expert_params_and_buffers = non_expert_named_params_and_buffers(self.args, self.model)
@@ -137,6 +138,12 @@ class UpdateWeightFromRemote:
 
     def leader_post_update(self) -> None:
         ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+        return
+
+    def prepare_for_transfer(self) -> None:
+        """Hook called at the start of update_weights_implementation, before the
+        all-gather loop.  Subclasses can override to do early setup (e.g.
+        reallocate offloaded memory and start async RDMA registration)."""
         return
 
     def finish_transfer_task(self) -> None:
