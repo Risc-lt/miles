@@ -24,10 +24,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     train_pp: int = 8
     train_cp: int = 4
     train_etp: int = 1
-    # Rollout parallelism (DeepSeek R1 pattern)
-    sglang_tp: int = 64  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
+    # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
+    sglang_tp: int = 32  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
     sglang_dp: int = 8
-    sglang_ep: int = 64
+    sglang_ep: int = 32
     sglang_pp: int = 1
     # Total Resources: 64 nodes = 512 GPUs, split 50/50
     num_train_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
@@ -114,10 +114,6 @@ def execute(args: ScriptArgs):
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
             f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
-            f"--load /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            f"--save /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            "--save-interval 20 "
-
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
