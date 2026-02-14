@@ -92,19 +92,10 @@ class StreamingTransferManager:
 
     def _do_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
         """GPU→CPU copy then RDMA write from CPU pinned memory. Runs in threadpool."""
-        gpu_params = bundle.params_dict
-        cpu_params = bundle.cpu_params_dict
         source_ptrs, source_lens = [], []
         valid_names = []
 
         for name in names:
-            if name not in cpu_params or name not in gpu_params:
-                logger.warning(f"[RDMA] Parameter {name} not found in CPU/GPU params")
-                continue
-
-            # D2H copy: GPU replica → CPU pinned replica
-            cpu_params[name].copy_(gpu_params[name])
-
             cpu_reg = bundle.weight_memory_registry.get(name)
             if cpu_reg is None:
                 logger.warning(f"[RDMA] Parameter {name} not in CPU weight registry")
@@ -361,10 +352,11 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         # Re-onload GPU replicas (offloaded at end of previous iteration)
         for transfer_bundle in self.engines.values():
             if transfer_bundle._offloaded:
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(weight.numel() * weight.element_size())
-                transfer_bundle._offloaded = False
-                logger.info("[RDMA] Re-onloaded GPU replica for load_weights")
+                with timer("rdma_cpu_onload"):
+                    for weight in transfer_bundle.model_replica.parameters():
+                        weight.untyped_storage().resize_(weight.numel() * weight.element_size())
+                    transfer_bundle._offloaded = False
+                    logger.info("[RDMA] Re-onloaded GPU replica for load_weights")
 
         if not self._registered:
             with timer("rdma_cpu_registration"):
@@ -389,6 +381,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
             torch.cuda.synchronize()
+            # D2H copy: GPU replica → CPU pinned replica
+            for name in transfer_ready_params:
+                transfer_bundle.cpu_params_dict[name].copy_(transfer_bundle.params_dict[name])
             self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
 
         converted_named_tensors.clear()
