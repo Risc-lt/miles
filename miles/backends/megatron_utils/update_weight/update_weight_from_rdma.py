@@ -35,6 +35,20 @@ def prepare_memory_region(model):
         weight_mr_dict[name] = (weight.data_ptr(), weight.numel(), weight.element_size())
         weight_addr_set.add(weight.data_ptr())
 
+    # Calculate and log total tensor size summary
+    total_bytes = 0
+    params_dict = dict(model.named_parameters())
+    logger.info("[RDMA] prepare_memory_region: Tensor size summary:")
+    for name, (_, numel, ele_size) in weight_mr_dict.items():
+        tensor_bytes = numel * ele_size
+        total_bytes += tensor_bytes
+        shape = tuple(params_dict[name].shape) if name in params_dict else "unknown"
+        logger.info(f"  {name}: shape={shape}, numel={numel}, element_size={ele_size}, bytes={tensor_bytes}")
+    logger.info(
+        f"[RDMA] Total tensor size: {total_bytes} bytes "
+        f"({total_bytes / 1024**2:.2f} MB, {total_bytes / 1024**3:.2f} GB)"
+    )
+
     memory_snapshot = torch.cuda.memory.memory_snapshot()
     merged_blocks = []
     for segment in memory_snapshot:
