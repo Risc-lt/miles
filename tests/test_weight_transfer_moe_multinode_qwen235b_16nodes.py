@@ -231,14 +231,14 @@ def execute(args: ScriptArgs):
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
 
-    profile_args = ""
-    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
-    profile_args += (
-        "--use-pytorch-profiler-update-weight "
-        "--profile-update-weight-start 2 "
-        "--profile-update-weight-end 3 "
-        f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
-    )
+    # profile_args = ""
+    # log_dir = os.environ.get("MILES_LOG_DIR", "/root")
+    # profile_args += (
+    #     "--use-pytorch-profiler-update-weight "
+    #     "--profile-update-weight-start 2 "
+    #     "--profile-update-weight-end 3 "
+    #     f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
+    # )
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
