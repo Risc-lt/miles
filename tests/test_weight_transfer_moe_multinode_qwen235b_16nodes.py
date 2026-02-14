@@ -116,10 +116,6 @@ def execute(args: ScriptArgs):
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
             f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
-            f"--load /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            f"--save /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            "--save-interval 20 "
-            
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
