@@ -33,7 +33,7 @@ def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
     return ServerArgs(**filtered_data)
 
 
-def register_cpu_memory_region(cpu_params_dict: dict, transfer_engine: TransferEngine) -> dict:
+def register_cpu_memory_region(params_dict: dict, transfer_engine: TransferEngine) -> dict:
     """Register CPU pinned memory with the transfer engine.
 
     Returns:
@@ -42,7 +42,7 @@ def register_cpu_memory_region(cpu_params_dict: dict, transfer_engine: TransferE
     start_tic = time.time()
     weight_mr_dict = {}
 
-    for name, cpu_tensor in cpu_params_dict.items():
+    for name, cpu_tensor in params_dict.items():
         addr = cpu_tensor.data_ptr()
         size = cpu_tensor.numel() * cpu_tensor.element_size()
         ret = transfer_engine.register_memory(addr, size)
@@ -61,15 +61,13 @@ class RemoteWeightInfo:
     weights_info: dict[str, tuple[int, int, int]]  # name -> (remote_address, numel, element_size)
 
 
-class StreamingTransferManager:
-    """Manages pipelined RDMA transfers through CPU pinned memory.
+class RDMATransferManager:
+    """Manages async RDMA writes from CPU pinned memory to remote GPUs.
 
-    Pipeline per bucket:
-      Main thread:  all-gather → load_weights(GPU) → cuda.sync → submit ──→ next bucket
-      Background:                                                   ↘ D2H copy → RDMA write
-
-    CPU registration is done synchronously on first iteration (fast, ~0.5-1s for host memory).
-    Registration persists across iterations.
+    The model replica lives on CPU as pinned memory. load_weights() writes
+    directly into it (GPU tensors are implicitly D2H-copied by .copy_()).
+    After load_weights, we submit RDMA writes from CPU to remote GPUs in
+    background threads — no GPU involvement at all.
     """
 
     def __init__(self, num_workers: int = 4):
@@ -78,27 +76,26 @@ class StreamingTransferManager:
         self.transfer_futures: list[Future] = []
 
     def ensure_started(self) -> None:
-        """Lazily create the transfer threadpool."""
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
     def submit_for_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """Submit a batch of ready tensors for D2H + RDMA transfer."""
+        """Submit RDMA writes for ready parameters. CPU memory is already populated."""
         if not names:
             return
         self.ensure_started()
-        future = self.executor.submit(self._do_transfer, bundle, names)
+        future = self.executor.submit(self._do_rdma_write, bundle, names)
         self.transfer_futures.append(future)
 
-    def _do_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """GPU→CPU copy then RDMA write from CPU pinned memory. Runs in threadpool."""
+    def _do_rdma_write(self, bundle: "TransferBundle", names: list[str]) -> None:
+        """RDMA write from CPU pinned memory to remote GPUs. Runs in threadpool."""
         source_ptrs, source_lens = [], []
         valid_names = []
 
         for name in names:
             cpu_reg = bundle.weight_memory_registry.get(name)
             if cpu_reg is None:
-                logger.warning(f"[RDMA] Parameter {name} not in CPU weight registry")
+                logger.warning(f"[RDMA] Parameter {name} not in weight registry")
                 continue
 
             data_ptr, numel, ele_size = cpu_reg
@@ -127,7 +124,7 @@ class StreamingTransferManager:
                 logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
     def wait_transfers(self) -> None:
-        """Wait for all transfers to complete. CPU memory and registration persist."""
+        """Wait for all RDMA writes to complete."""
         for future in self.transfer_futures:
             try:
                 future.result(timeout=30.0)
@@ -139,15 +136,19 @@ class StreamingTransferManager:
 
 @dataclasses.dataclass
 class TransferBundle:
-    model_replica: torch.nn.Module
+    """Holds a CPU pinned model replica and its RDMA transfer state.
+
+    The model replica lives permanently on CPU as pinned memory. load_weights()
+    writes directly into it — sglang's weight loaders use .copy_() which
+    handles GPU→CPU transfer implicitly. No GPU replica, no offload/re-onload.
+    """
+
+    model_replica: torch.nn.Module  # lives on CPU (pinned memory)
     engine: TransferEngine
     remote_weight_infos: list[RemoteWeightInfo]
     param_mapper: ParameterMapper
-    # CPU pinned mirror of GPU replica parameters — RDMA source
-    cpu_params_dict: dict = dataclasses.field(default_factory=dict)
     # CPU weight memory registry: name -> (data_ptr, numel, element_size)
     weight_memory_registry: dict = dataclasses.field(default_factory=dict)
-    _offloaded: bool = False
     _cached_params_dict: dict = dataclasses.field(default_factory=dict)
     _update_pending: dict[str, int] = dataclasses.field(default_factory=dict)
 
@@ -162,17 +163,6 @@ class TransferBundle:
 
     def add_remote_session(self, remote_info: RemoteWeightInfo) -> None:
         self.remote_weight_infos.append(remote_info)
-
-    def allocate_cpu_replica(self) -> None:
-        """Allocate CPU pinned memory mirroring the GPU model replica."""
-        self.cpu_params_dict = {}
-        for name, param in self.model_replica.named_parameters():
-            self.cpu_params_dict[name] = torch.empty_like(param, device="cpu").pin_memory()
-        total_bytes = sum(t.numel() * t.element_size() for t in self.cpu_params_dict.values())
-        logger.info(
-            f"[RDMA] Allocated CPU pinned replica: {len(self.cpu_params_dict)} params, "
-            f"{total_bytes / (1024**3):.2f} GB"
-        )
 
     def get_transfer_ready_params(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> list[str]:
         """Track which parameters are ready (all shards loaded)."""
@@ -206,18 +196,17 @@ class TransferBundle:
 
 
 class UpdateWeightFromRDMA(UpdateWeightFromRemote):
-    """RDMA weight transfer using CPU pinned memory as the transfer source.
+    """RDMA weight transfer using a CPU pinned model replica.
 
     Architecture:
-    - GPU model replica: used for load_weights (preserves all sglang model logic)
-    - CPU pinned replica: registered with RDMA, used as transfer source
-    - GPU replica is re-onloaded each iteration, offloaded after transfer
-    - CPU replica + host MR registration persist across iterations (cheap)
+    - Model replica lives on CPU as pinned memory (created once, persists across iterations)
+    - load_weights() writes directly into CPU pinned params (GPU→CPU via implicit .copy_())
+    - RDMA writes from CPU pinned memory to remote rollout GPUs
+    - No GPU replica, no offload/re-onload cycle, no GPU memory pressure
 
-    Per-iteration pipeline:
-      on_transfer_start:  re-onload GPU replica (+ first-time CPU registration, ~0.5-1s)
-      per bucket:         all-gather → load_weights(GPU) → sync → submit(D2H + RDMA)
-      finish:             wait all transfers → offload GPU replica → training resumes
+    Per-iteration flow:
+      per bucket:  all-gather(GPU) → load_weights(CPU replica) → submit RDMA write
+      finish:      wait all RDMA writes
     """
 
     def __init__(
@@ -240,7 +229,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         self._registered = False
         num_workers = getattr(args, "rdma_transfer_workers", 4)
-        self.transfer_manager = StreamingTransferManager(num_workers=num_workers)
+        self.transfer_manager = RDMATransferManager(num_workers=num_workers)
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -287,24 +276,23 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 )
                 if target.engine_rank not in self.engines:
                     transfer_engine = self._create_transfer_engine()
-                    logger.info(f"[RDMA] Creating model replica for engine rank {target.engine_rank}")
-                    model_replica = self._create_inference_replica(
+                    logger.info(f"[RDMA] Creating CPU model replica for engine rank {target.engine_rank}")
+                    model_replica = self._create_cpu_replica(
                         parallelism_config, self.args.hf_checkpoint, self.session_id_to_server_args[session_id]
                     )
                     param_mapper = ParameterMapper.from_model(model_replica)
-                    print_memory(f"[RDMA] After model replica at {target.engine_rank}")
+                    print_memory(f"[RDMA] After CPU model replica for engine rank {target.engine_rank}")
                     bundle = TransferBundle(
                         model_replica=model_replica,
                         engine=transfer_engine,
                         remote_weight_infos=[remote_info],
                         param_mapper=param_mapper,
                     )
-                    bundle.allocate_cpu_replica()
                     self.engines[target.engine_rank] = bundle
                 else:
                     self.engines[target.engine_rank].add_remote_session(remote_info)
 
-            print_memory("[RDMA] After Local Engine Replicas and engine Creation")
+            print_memory("[RDMA] After all CPU replicas and engine creation")
 
     def _create_transfer_engine(self) -> TransferEngine:
         transfer_engine = TransferEngine()
@@ -313,12 +301,13 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         logger.info(f"[RDMA] Transfer Engine initialized at port {transfer_engine.get_rpc_port()}")
         return transfer_engine
 
-    def _create_inference_replica(
+    def _create_cpu_replica(
         self,
         parallelism_config: RankParallelismConfig,
         model_path: str,
         server_args: ServerArgs,
-    ):
+    ) -> torch.nn.Module:
+        """Create model on GPU (required by sglang), then move to CPU pinned memory."""
         load_config = LoadConfig(
             load_format="auto",
             model_loader_extra_config=server_args.model_loader_extra_config,
@@ -331,8 +320,25 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 load_config=load_config,
                 device_config=DeviceConfig(),
             )
-        device = next(model.parameters()).device
-        logger.info(f" Model {device}, params: {sum(p.numel() for p in model.parameters())} ")
+
+        gpu_params = sum(p.numel() for p in model.parameters())
+        logger.info(f"[RDMA] GPU model created: {gpu_params} params")
+
+        # Move all parameters to CPU pinned memory
+        with timer("rdma_move_replica_to_cpu"):
+            for param in model.parameters():
+                cpu_data = param.data.to("cpu", non_blocking=True).pin_memory()
+                param.data = cpu_data
+            torch.cuda.synchronize()
+
+        torch.cuda.empty_cache()
+
+        total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+        logger.info(
+            f"[RDMA] CPU pinned replica: {gpu_params} params, "
+            f"{total_bytes / (1024**3):.2f} GB"
+        )
+        print_memory("[RDMA] After moving replica to CPU and freeing GPU")
         return model
 
     def leader_post_update(self) -> None:
@@ -345,34 +351,26 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         )
 
     def on_transfer_start(self) -> None:
-        """Re-onload GPU replica for load_weights. First call also registers CPU memory."""
+        """Register CPU pinned memory with RDMA on first call."""
         if not self._is_source:
             return
-
-        # Re-onload GPU replicas (offloaded at end of previous iteration)
-        for transfer_bundle in self.engines.values():
-            if transfer_bundle._offloaded:
-                with timer("rdma_cpu_onload"):
-                    for weight in transfer_bundle.model_replica.parameters():
-                        weight.untyped_storage().resize_(weight.numel() * weight.element_size())
-                    transfer_bundle._offloaded = False
-                    logger.info("[RDMA] Re-onloaded GPU replica for load_weights")
 
         if not self._registered:
             with timer("rdma_cpu_registration"):
                 for bundle in self.engines.values():
                     bundle.weight_memory_registry = register_cpu_memory_region(
-                        bundle.cpu_params_dict, bundle.engine
+                        bundle.params_dict, bundle.engine
                     )
             self._registered = True
 
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """Load weights into GPU replica, submit D2H + RDMA to background threads.
+        """Load weights directly into CPU replica, submit RDMA writes.
 
-        Critical path: all-gather → load_weights(GPU) → cuda.sync → submit → next bucket
-        Background:                                                    ↘ D2H copy → RDMA write
+        load_weights() calls .copy_() on CPU pinned params with GPU source tensors,
+        which implicitly performs GPU→CPU transfer. No separate D2H step needed.
+        After load_weights, submit async RDMA writes from CPU to remote GPUs.
         """
         if not self._is_source or not converted_named_tensors:
             return
@@ -380,32 +378,18 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         for transfer_bundle in self.engines.values():
             transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             transfer_bundle.model_replica.load_weights(converted_named_tensors)
-            torch.cuda.synchronize()
-            # D2H copy: GPU replica → CPU pinned replica
-            for name in transfer_ready_params:
-                transfer_bundle.cpu_params_dict[name].copy_(transfer_bundle.params_dict[name])
             self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
 
         converted_named_tensors.clear()
 
     def finish_transfer_task(self) -> None:
-        """Wait for all D2H + RDMA transfers, then offload GPU replica."""
+        """Wait for all RDMA writes to complete."""
         if not self._is_source:
             return
 
-        logger.info("[RDMA] Waiting for all D2H + RDMA transfers to complete...")
+        logger.info("[RDMA] Waiting for RDMA transfers to complete...")
         self.transfer_manager.wait_transfers()
         logger.info("[RDMA] All transfers complete")
 
         for transfer_bundle in self.engines.values():
             transfer_bundle.reset()
-
-        # Offload GPU replica — CPU replica + registration persist
-        print_memory("[RDMA] Before offloading GPU replica")
-        for transfer_bundle in self.engines.values():
-            if not transfer_bundle._offloaded:
-                for weight in transfer_bundle.model_replica.parameters():
-                    weight.untyped_storage().resize_(0)
-                transfer_bundle._offloaded = True
-        torch.cuda.empty_cache()
-        print_memory("[RDMA] After offloading GPU replica")
