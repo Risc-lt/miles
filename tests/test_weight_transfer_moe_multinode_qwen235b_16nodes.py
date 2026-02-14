@@ -250,7 +250,7 @@ def execute(args: ScriptArgs):
         f"{sglang_args} "
         # f"{ci_args} "
         f"{misc_args} "
-        f"{profile_args} "
+        # f"{profile_args} "
     )
     if args.node_rank > 0:
         time.sleep(20)
