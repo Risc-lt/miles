@@ -32,7 +32,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     num_train_gpus: int = 8 * GPUS_PER_NODE  # 8 nodes * 8 GPUs
     num_rollout_gpus: int = 64  # 8 nodes * 8 GPUs for rollout
     # Optimizations
-    pipelined_transfer: bool = False
+    pipelined_transfer: bool = False  # Legacy field, pipelining is always on for RDMA
     # Profiling
     use_pytorch_profiler_update_weight: bool = False
     # multi-node settings
@@ -46,6 +46,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_nccl_nvls: bool = False
     bucket_size: float = 1.0
     released_mc_transfer_timeout: bool = False
+    no_save_optim: bool = False
 
     def validate(self):
         if self.multinode:
@@ -115,9 +116,6 @@ def execute(args: ScriptArgs):
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
             f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
-            f"--load /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            f"--save /root/multinode/{MODEL_NAME}_slime_nodes/ "
-            "--save-interval 20 "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
@@ -128,7 +126,8 @@ def execute(args: ScriptArgs):
             f"--save /root/{MODEL_NAME}_slime "
         )
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
-
+    if args.no_save_optim:
+        ckpt_args += "--no-save-optim "
     rollout_args = (
         "--prompt-data /root/datasets/dapo-math-17k/dapo-math-17k.jsonl "
         "--input-key prompt "
@@ -136,7 +135,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 3 "
+        "--num-rollout 12 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -208,12 +207,9 @@ def execute(args: ScriptArgs):
         sglang_args += "--sglang-enable-dp-attention "
     mem = (
         int(args.bucket_size * 1024 * 1024 * 1024)
-        if args.pipelined_transfer and args.mode == "rdma"
+        if args.mode == "rdma"
         else (4 * 1024 * 1024 * 1024)
     )
-    if args.pipelined_transfer and args.mode == "rdma":
-        sglang_args += "--rdma-pipelined-transfer "
-
     # ci_args = "--ci-test "
 
     misc_args = (
@@ -230,24 +226,18 @@ def execute(args: ScriptArgs):
         # 4GB buffer for weight update
         f"--update-weight-buffer-size {mem} "
         # enable correctness check
-        # f"--check-weight-update-equal "
+        f"--check-weight-update-equal "
     )
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
 
     profile_args = ""
-    if bool(args.use_pytorch_profiler_update_weight):
-        profile_args += (
-            "--use-pytorch-profiler-update-weight "
-            "--profile-update-weight-start 2 "
-            "--profile-update-weight-end 3 "
-            "--tensorboard-dir /root/profiler_logs/ "
-        )
+    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
     profile_args += (
         "--use-pytorch-profiler-update-weight "
         "--profile-update-weight-start 2 "
         "--profile-update-weight-end 3 "
-        "--tensorboard-dir /root/newnew_profiler_logs/ "
+        f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
     )
     train_args = (
         f"{ckpt_args} "
@@ -280,6 +270,7 @@ def execute(args: ScriptArgs):
             "NCCL_NVLS_ENABLE": (
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
+            **({"MILES_LOG_DIR": os.environ["MILES_LOG_DIR"]} if "MILES_LOG_DIR" in os.environ else {}),
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,

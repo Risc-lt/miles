@@ -1,46 +1,53 @@
 # TODO(jensen): may need to merge this file into the main test file in the future.
 from dataclasses import dataclass
 from typing import Literal
-
 import typer
-
 import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
-MODEL_NAME = "Moonlight-16B-A3B-Instruct"
-MODEL_TYPE = "moonlight"
+MODEL_NAME = "Kimi-K2-Instruct"
+MODEL_TYPE = "kimi-k2"
+import time
 
 GPUS_PER_NODE = 8
 # For h100 80g * 8:
 # training gpu cannot be only 1 because of oom
+import os
 
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["nccl", "rdma"] = "nccl"
-    # Right now tp=ep=pp=1
+    # Training parallelism (matches colocated run-kimi-k2-Instruct.sh)
     train_tp: int = 8
-    train_ep: int = 1
-    train_pp: int = 1
-    train_cp: int = 1
-    train_etp: int = 8
-    sglang_tp: int = 8  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
-    sglang_dp: int = 1
-    sglang_ep: int = 1
+    train_ep: int = 32
+    train_pp: int = 8
+    train_cp: int = 4
+    train_etp: int = 1
+    # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
+    sglang_tp: int = 32  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
+    sglang_dp: int = 8
+    sglang_ep: int = 32
     sglang_pp: int = 1
-    # Total Ressources
-    num_train_gpus: int = 8
-    num_rollout_gpus: int = 8
+    # Total Resources: 64 nodes = 512 GPUs, split 50/50
+    num_train_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
+    num_rollout_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
     # Optimizations
     pipelined_transfer: bool = False
     # Profiling
     use_pytorch_profiler_update_weight: bool = False
     # multi-node settings
-    multinode: bool = False
+    multinode: bool = True
     head_node_ip: str | None = None
     node_rank: int = 0
-    nnodes: int = 1
-    decoder_last_pipeline_num_layers: int | None = None
+    nnodes: int = 64
+    # 61 layers, PP=8: ceil(61/8)=8 per stage, last stage = 61 - 8*7 = 5
+    decoder_last_pipeline_num_layers: int = 5
+    wait_after: bool = False
+    enable_nccl_nvls: bool = False
+    bucket_size: float = 1.0
+    released_mc_transfer_timeout: bool = False
+    no_save_optim: bool = False
 
     def validate(self):
         if self.multinode:
@@ -55,16 +62,15 @@ def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
         U.exec_command(
-            "hf download moonshotai/Moonlight-16B-A3B-Instruct --local-dir /root/models/Moonlight-16B-A3B-Instruct"
+            "hf download Kimi/Kimi-K2-Instruct --local-dir /root/models/Kimi-K2-Instruct"
         )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
+        U.hf_download_dataset("zhuzilin/aime-2024")
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
     if not args.multinode:
         U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
     else:
         # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
-        # Convert training/rollout nodes separately
-        # assert args.num_train_gpus % args.num_rollout_gpus == 0 or args.num_rollout_gpus % args.num_train_gpus == 0
         U.convert_checkpoint(
             model_name=MODEL_NAME,
             megatron_model_type=MODEL_TYPE,
@@ -80,6 +86,7 @@ def prepare(args: ScriptArgs):
 
 def execute(args: ScriptArgs):
     # Log experiment configuration at the start
+
     log_experiment_start(
         {
             "mode": args.mode,
@@ -88,6 +95,8 @@ def execute(args: ScriptArgs):
             "train_tp": args.train_tp,
             "train_ep": args.train_ep,
             "train_pp": args.train_pp,
+            "train_cp": args.train_cp,
+            "train_etp": args.train_etp,
             "sglang_tp": args.sglang_tp,
             "sglang_dp": args.sglang_dp,
             "sglang_ep": args.sglang_ep,
@@ -104,13 +113,19 @@ def execute(args: ScriptArgs):
         num_gpus_per_node = 8
         ckpt_args = (
             f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
-            f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist_nodes_{args.nnodes} "
+            f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
-        ckpt_args = f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/{MODEL_NAME}_torch_dist "
+        ckpt_args = (
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
+            f"--ref-load /root/{MODEL_NAME}_torch_dist "
+            f"--load /root/{MODEL_NAME}_slime "
+            f"--save /root/{MODEL_NAME}_slime "
+        )
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
-
+    if args.no_save_optim:
+        ckpt_args += "--no-save-optim "
     rollout_args = (
         "--prompt-data /root/datasets/dapo-math-17k/dapo-math-17k.jsonl "
         "--input-key prompt "
@@ -118,37 +133,45 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 2 "
-        "--rollout-batch-size 4 "
-        "--n-samples-per-prompt 4 "
+        "--num-rollout 4 "
+        "--rollout-batch-size 8 "
+        "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
         "--rollout-temperature 0.8 "
-        "--global-batch-size 16 "
+        "--global-batch-size 64 "
         "--balance-data "
     )
-    # Training parallellism settings
+
+    # Training parallelism settings
     perf_args = (
         f"--tensor-model-parallel-size {args.train_tp} "
         "--sequence-parallel "  # NOTE: necessary: ```ValueError: During training, performance may degrade if MoE and tensor parallelismare enabled without also enabling sequence parallelism.```
-        f"--context-parallel-size {args.train_cp} "
         f"--pipeline-model-parallel-size {args.train_pp} "
+        f"--context-parallel-size {args.train_cp} "
         f"--expert-model-parallel-size {args.train_ep} "
         f"--expert-tensor-parallel-size {args.train_etp} "
+        f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
         "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 2048 "
+        "--max-tokens-per-gpu 16384 "
     )
-    if args.decoder_last_pipeline_num_layers is not None:
-        perf_args += f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
+
+    # Evaluation settings
+    eval_args = (
+        # "--eval-interval 20 "  # Commented out in original script
+        "--eval-prompt-data aime /root/datasets/aime-2024/aime-2024.jsonl "
+        "--n-samples-per-eval-prompt 16 "
+        "--eval-max-response-len 16384 "
+        "--eval-top-p 0.7 "
+    )
 
     grpo_args = (
         "--advantage-estimator gspo "
-        # "--use-kl-loss "
+        # "--use-kl-loss "  # Commented out in original script
         "--kl-loss-coef 0.00 "
         "--kl-loss-type low_var_kl "
-        "--kl-coef 0.00 "
         "--entropy-coef 0.00 "
         "--eps-clip 4e-4 "
     )
@@ -160,20 +183,33 @@ def execute(args: ScriptArgs):
         "--weight-decay 0.1 "
         "--adam-beta1 0.9 "
         "--adam-beta2 0.98 "
+        "--optimizer-cpu-offload "
+        "--overlap-cpu-optimizer-d2h-h2d "
+        "--use-precision-aware-optimizer "
     )
 
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        f"--sglang-data-parallel-size {args.sglang_dp} "
-        f"--sglang-expert-parallel-size {args.sglang_ep} "
-        f"--sglang-pipeline-parallel-size {args.sglang_pp} "
-        "--sglang-mem-fraction-static 0.8 "
+        "--sglang-mem-fraction-static 0.75 "
+        "--sglang-enable-dp-attention "
+        f"--sglang-dp-size {args.sglang_dp} "
+        f"--sglang-ep-size {args.sglang_ep} "
+        "--sglang-enable-dp-lm-head "
+        "--sglang-cuda-graph-bs 1 2 4 8 16 "
+        # K2-specific: dense TP size and server concurrency
+        "--sglang-moe-dense-tp-size 1 "
+        "--sglang-server-concurrency 1024 "
     )
-    if args.sglang_dp > 1:
-        sglang_args += "--sglang-enable-dp-attention "
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    if args.sglang_dp > 1:
+        sglang_args += "--sglang-enable-dp-attention "
+    mem = (
+        int(args.bucket_size * 1024 * 1024 * 1024)
+        if args.pipelined_transfer and args.mode == "rdma"
+        else (4 * 1024 * 1024 * 1024)
+    )
     # ci_args = "--ci-test "
 
     misc_args = (
@@ -183,12 +219,15 @@ def execute(args: ScriptArgs):
         # should be good for model performance
         "--accumulate-allreduce-grads-in-fp32 "
         "--attention-softmax-in-fp32 "
-        # need to comment this when using model with MLA
+        # K2 uses MLA (same as Qwen)
         "--attention-backend flash "
-        "--actor-num-nodes 1 "
-        f"--actor-num-gpus-per-node {args.num_train_gpus} "
-        # 1GB buffer for weight update
-        f"--update-weight-buffer-size {1 * 1024 ** 3} "
+        # K2-specific: enable DeepEP for training MoE
+        "--moe-enable-deepep "
+        "--moe-token-dispatcher-type flex "
+        f"--actor-num-nodes {args.num_train_gpus // GPUS_PER_NODE} "
+        f"--actor-num-gpus-per-node {GPUS_PER_NODE} "
+        # 4GB buffer for weight update
+        f"--update-weight-buffer-size {mem} "
         # enable correctness check
         f"--check-weight-update-equal "
     )
@@ -196,23 +235,24 @@ def execute(args: ScriptArgs):
         misc_args += "--update-weight-transfer-mode rdma "
 
     profile_args = ""
+    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
     if bool(args.use_pytorch_profiler_update_weight):
         profile_args += (
             "--use-pytorch-profiler-update-weight "
             "--profile-update-weight-start 2 "
             "--profile-update-weight-end 3 "
-            "--tensorboard-dir /root/profiler_logs/ "
+            f"--tensorboard-dir {log_dir}/profiler_logs/ "
         )
-    profile_args = (
+    profile_args += (
         "--use-pytorch-profiler-update-weight "
-        "--profile-update-weight-start 0 "
-        "--profile-update-weight-end 6 "
-        "--tensorboard-dir /root/profiler_logs/ "
+        "--profile-update-weight-start 2 "
+        "--profile-update-weight-end 3 "
+        f"--tensorboard-dir {log_dir}/new_{args.mode}_profiler_logs/ "
     )
-
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
+        f"{eval_args} "
         f"{optimizer_args} "
         f"{grpo_args} "
         f"{U.get_default_wandb_args(__file__)} "
@@ -222,17 +262,35 @@ def execute(args: ScriptArgs):
         f"{misc_args} "
         f"{profile_args} "
     )
-
+    if args.node_rank > 0:
+        time.sleep(20)
+    os.environ["MODEL_ARGS_ROTARY_BASE"] = "50000"
+    # TODO(xinji1): figure it out if the timeout is the root cause of `Batch transfer failed with error code`
+    mc_transfer_timeout = "300" if args.released_mc_transfer_timeout else "30"
     U.execute_train(
         train_args=train_args,
         num_gpus_per_node=num_gpus_per_node,
         megatron_model_type=MODEL_TYPE,
-        train_script="train_async.py",
-        extra_env_vars={"RAY_DEBUG": "1"},
+        train_script="train.py",
+        extra_env_vars={
+            "MC_TRANSFER_TIMEOUT": mc_transfer_timeout,
+            "RAY_DEBUG": "1",
+            "PYTHONPATH": "/root/Megatron-LM/",
+            "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+            "NCCL_NVLS_ENABLE": (
+                "1" if args.enable_nccl_nvls else "0"
+            ),  # Assuming NVLINK is available for multi-node setup
+            **({"MILES_LOG_DIR": os.environ["MILES_LOG_DIR"]} if "MILES_LOG_DIR" in os.environ else {}),
+        },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,
         num_gpus=num_gpus,
     )
+    if args.node_rank > 0 and args.wait_after:
+        if args.mode == "nccl":
+            time.sleep(800)
+        else:
+            time.sleep(3600)
 
 
 @U.dataclass_cli

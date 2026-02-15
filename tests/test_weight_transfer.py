@@ -132,8 +132,6 @@ def execute(args: ScriptArgs):
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
-    if args.pipelined_transfer and args.mode == "rdma":
-        sglang_args += "--rdma-pipelined-transfer "
     # ci_args = "--ci-test "
 
     misc_args = (
@@ -150,7 +148,7 @@ def execute(args: ScriptArgs):
         # 1GB buffer for weight update
         f"--update-weight-buffer-size {1 * 1024 ** 3} "
         # enable correctness check
-        # f"--check-weight-update-equal "
+        f"--check-weight-update-equal "
     )
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "

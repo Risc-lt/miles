@@ -187,16 +187,24 @@ class RemoteTransferPlan:
                 assignements[select_source][k_idx].append(m_idx)
 
         # Extract transfer tasks for current rank.
-        logger.info(f"[TransferPlanner] Full transfer assignments: {dict(assignements)}")
         transfer_tasks = []
         for engine_rank, engine_indices in assignements[self._rank].items():
             for engine_ind in engine_indices:
-                logger.info(
-                    f"[TransferPlanner] New task: source_rank={self._rank} pp_shard={self._pp_rank} -> target_engine_ind={engine_ind}, target_engine_rank={engine_rank}"
-                )
                 transfer_tasks.append(
                     TransferTaskP2PMeta(source_shard=self._pp_rank, engine_ind=engine_ind, engine_rank=engine_rank)
                 )
+
+        # Log readable plan for current rank
+        by_rank = defaultdict(list)
+        for t in transfer_tasks:
+            by_rank[t.engine_rank].append(t.engine_ind)
+        dest_lines = [f"    engine_rank={r} -> engine(s) {sorted(by_rank[r])}" for r in sorted(by_rank)]
+        logger.info(
+            f"[TransferPlanner] Plan for gathered_dp_rank={self._rank} (pp={self._pp_rank}): "
+            f"{self._size} source replicas, {len(transfer_tasks)} transfer(s) to "
+            f"{self._rollout_engine_count} engine(s) x {self._rollout_num_gpu_per_engine} ranks/engine\n"
+            + "\n".join(dest_lines)
+        )
         return transfer_tasks
 
     def is_source(self) -> bool:

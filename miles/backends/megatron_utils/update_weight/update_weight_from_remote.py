@@ -100,6 +100,9 @@ class UpdateWeightFromRemote:
         dist.barrier(group=get_gloo_group())
 
         with timer("update_weights_implementation"):
+            # Hook for subclasses to start background work (e.g., RDMA registration)
+            self.on_transfer_start()
+
             # A single traversal through all parameters to update weights. Update happens first to the
             # non-expert weights, then to expert weights.
             non_expert_params_and_buffers = non_expert_named_params_and_buffers(self.args, self.model)
@@ -138,6 +141,9 @@ class UpdateWeightFromRemote:
     def leader_post_update(self) -> None:
         ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
         return
+
+    def on_transfer_start(self) -> None:
+        """Hook called at start of weight transfer cycle. Override for setup work like starting background registration."""
 
     def finish_transfer_task(self) -> None:
         return
@@ -252,9 +258,10 @@ class UpdateWeightFromRemote:
             return
 
         all_gathered_params = sum(all_gathered_params, [])
-        converted_hf_tensors = []
-        for name, param in all_gathered_params:
-            converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        with timer("expert_convert_to_hf", log_info=False):
+            converted_hf_tensors = []
+            for name, param in all_gathered_params:
+                converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
 
         self._update_bucket_weights_from_remote(converted_hf_tensors, pbar)
 
