@@ -280,7 +280,7 @@ def execute(args: ScriptArgs):
         if args.mode == "nccl":
             time.sleep(800)
         else:
-            time.sleep(720)
+            time.sleep(1000)
 
 
 @U.dataclass_cli
