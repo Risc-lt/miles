@@ -376,7 +376,8 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             return
 
         for transfer_bundle in self.engines.values():
-            transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
+            with timer("get_transfer_ready_params", log_info=False):
+                transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             with timer("load_weights_to_cpu_replica", log_info=False):
                 transfer_bundle.model_replica.load_weights(converted_named_tensors)
             with timer("rdma_submit", log_info=False):

@@ -66,6 +66,8 @@ def get_timer_group(timer_name: str) -> str | None:
         return "expert_ep_gather"
     if timer_name == "load_weights_to_cpu_replica":
         return "load_weights_to_cpu_replica"
+    if timer_name == "get_transfer_ready_params":
+        return "get_transfer_ready_params"
     if timer_name == "rdma_submit":
         return "rdma_submit"
     if timer_name == "expert_convert_to_hf":
@@ -162,6 +164,7 @@ def consolidate_timer_log(input_file: str, output_file: str) -> None:
         "non_expert_tp_gather",
         "load_weights_to_cpu_replica",
         "rdma_submit",
+        "get_transfer_ready_params",
         "expert_tp_gather",
         "expert_ep_gather",
         "expert_convert_to_hf",

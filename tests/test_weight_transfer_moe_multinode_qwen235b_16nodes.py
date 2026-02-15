@@ -135,7 +135,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 4 "
+        "--num-rollout 12 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -231,14 +231,14 @@ def execute(args: ScriptArgs):
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
 
-    # profile_args = ""
-    # log_dir = os.environ.get("MILES_LOG_DIR", "/root")
-    # profile_args += (
-    #     "--use-pytorch-profiler-update-weight "
-    #     "--profile-update-weight-start 2 "
-    #     "--profile-update-weight-end 3 "
-    #     f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
-    # )
+    profile_args = ""
+    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
+    profile_args += (
+        "--use-pytorch-profiler-update-weight "
+        "--profile-update-weight-start 2 "
+        "--profile-update-weight-end 3 "
+        f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
+    )
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
@@ -250,7 +250,7 @@ def execute(args: ScriptArgs):
         f"{sglang_args} "
         # f"{ci_args} "
         f"{misc_args} "
-        # f"{profile_args} "
+        f"{profile_args} "
     )
     if args.node_rank > 0:
         time.sleep(20)
