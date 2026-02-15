@@ -135,7 +135,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 12 "
+        "--num-rollout 5 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -280,7 +280,7 @@ def execute(args: ScriptArgs):
         if args.mode == "nccl":
             time.sleep(800)
         else:
-            time.sleep(1000)
+            time.sleep(720)
 
 
 @U.dataclass_cli
