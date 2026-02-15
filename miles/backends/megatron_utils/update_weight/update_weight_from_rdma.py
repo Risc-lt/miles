@@ -204,9 +204,12 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
     - RDMA writes from CPU pinned memory to remote rollout GPUs
     - No GPU replica, no offload/re-onload cycle, no GPU memory pressure
 
-    Per-iteration flow:
-      per bucket:  all-gather(GPU) → load_weights(CPU replica) → submit RDMA write
-      finish:      wait all RDMA writes
+    Per-iteration pipelined flow:
+      per bucket:  all-gather(GPU, default stream) → record event
+                   d2h_stream waits event → load_weights(CPU replica) → submit RDMA write
+      The next bucket's all-gather overlaps with the current bucket's D2H + RDMA.
+      At most 2 buckets alive at once (double-buffer).
+      finish:      drain pipeline → wait all RDMA writes
     """
 
     def __init__(
@@ -230,6 +233,11 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         self._registered = False
         num_workers = getattr(args, "rdma_transfer_workers", 4)
         self.transfer_manager = RDMATransferManager(num_workers=num_workers)
+
+        # Pipeline state: overlap all_gather (default stream) with D2H + RDMA (d2h_stream)
+        self.d2h_stream = torch.cuda.Stream()
+        self._pending_tensors: list[tuple[str, torch.Tensor]] | None = None
+        self._pending_event: torch.cuda.Event | None = None
 
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -366,24 +374,60 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """Load weights directly into CPU replica, submit RDMA writes.
+        """Pipelined bucket transfer: overlap D2H with next bucket's all_gather.
 
-        load_weights() calls .copy_() on CPU pinned params with GPU source tensors,
-        which implicitly performs GPU→CPU transfer. No separate D2H step needed.
-        After load_weights, submit async RDMA writes from CPU to remote GPUs.
+        Records a CUDA event on the default stream (where all_gather produced the
+        data), then launches load_weights + RDMA submit on a separate d2h_stream
+        that waits on that event.  CPU returns immediately so the next all_gather
+        can start on the default stream while D2H runs concurrently.
+
+        Double-buffer invariant: at most 2 converted_named_tensors lists alive —
+        _pending_tensors (being D2H'd) and converted_named_tensors (being filled).
         """
         if not self._is_source or not converted_named_tensors:
             return
 
-        for transfer_bundle in self.engines.values():
-            with timer("get_transfer_ready_params", log_info=False):
-                transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
-            with timer("load_weights_to_cpu_replica", log_info=False):
-                transfer_bundle.model_replica.load_weights(converted_named_tensors)
-            with timer("rdma_submit", log_info=False):
-                self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
+        # 1. Record event on default stream: all_gather data for this bucket is ready
+        event = torch.cuda.Event()
+        event.record()  # records on current (default) stream
 
+        # 2. Wait for PREVIOUS bucket's D2H to finish (double-buffer: max 2 alive)
+        if self._pending_event is not None:
+            self._pending_event.synchronize()
+            self._pending_tensors = None
+
+        # 3. Snapshot current bucket's tensors before caller refills the list
+        self._pending_tensors = list(converted_named_tensors)
         converted_named_tensors.clear()
+
+        # 4. Launch D2H + RDMA on d2h_stream, gated on the all_gather event
+        self._pending_event = torch.cuda.Event()
+        pending = self._pending_tensors
+        with torch.cuda.stream(self.d2h_stream):
+            self.d2h_stream.wait_event(event)
+            for transfer_bundle in self.engines.values():
+                with timer("get_transfer_ready_params", log_info=False):
+                    transfer_ready_params = transfer_bundle.get_transfer_ready_params(pending)
+                with timer("load_weights_to_cpu_replica", log_info=False):
+                    transfer_bundle.model_replica.load_weights(pending)
+                with timer("rdma_submit", log_info=False):
+                    self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
+            self._pending_event.record(self.d2h_stream)
+
+    def _drain_pipeline(self) -> None:
+        """Wait for the last pipelined D2H + RDMA submit to complete."""
+        if self._pending_event is not None:
+            self._pending_event.synchronize()
+            self._pending_tensors = None
+            self._pending_event = None
+
+    def _update_weights(self, named_params_and_buffers: Sequence[tuple[str, torch.Tensor]]) -> None:
+        super()._update_weights(named_params_and_buffers)
+        self._drain_pipeline()
+
+    def _update_expert_weights(self, named_params_and_buffers: Sequence[tuple[str, torch.Tensor]]) -> None:
+        super()._update_expert_weights(named_params_and_buffers)
+        self._drain_pipeline()
 
     def finish_transfer_task(self) -> None:
         """Wait for all RDMA writes to complete."""
