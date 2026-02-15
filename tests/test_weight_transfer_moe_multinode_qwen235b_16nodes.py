@@ -46,6 +46,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     enable_nccl_nvls: bool = False
     bucket_size: float = 1.0
     released_mc_transfer_timeout: bool = False
+    no_save_optim: bool = False
 
     def validate(self):
         if self.multinode:
@@ -118,6 +119,7 @@ def execute(args: ScriptArgs):
             f"--load /root/multinode/{MODEL_NAME}_slime_nodes/ "
             f"--save /root/multinode/{MODEL_NAME}_slime_nodes/ "
             "--save-interval 20 "
+            
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
@@ -128,7 +130,8 @@ def execute(args: ScriptArgs):
             f"--save /root/{MODEL_NAME}_slime "
         )
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
-
+    if args.no_save_optim:
+        ckpt_args += "--no-save-optim "
     rollout_args = (
         "--prompt-data /root/datasets/dapo-math-17k/dapo-math-17k.jsonl "
         "--input-key prompt "
@@ -136,7 +139,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 3 "
+        "--num-rollout 4 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -247,7 +250,7 @@ def execute(args: ScriptArgs):
         "--use-pytorch-profiler-update-weight "
         "--profile-update-weight-start 2 "
         "--profile-update-weight-end 3 "
-        "--tensorboard-dir /root/newnew_profiler_logs/ "
+        f"--tensorboard-dir /root/new_{args.mode}_profiler_logs/ "
     )
     train_args = (
         f"{ckpt_args} "

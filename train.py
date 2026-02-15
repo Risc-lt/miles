@@ -1,3 +1,5 @@
+import logging
+
 import ray
 
 from miles.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -5,6 +7,8 @@ from miles.utils.arguments import parse_args
 from miles.utils.logging_utils import configure_logger
 from miles.utils.misc import should_run_periodic_action
 from miles.utils.tracking_utils import init_tracking
+
+logger = logging.getLogger(__name__)
 
 
 def train(args):
@@ -48,16 +52,20 @@ def train(args):
             actor_model.clear_memory()
 
     def save(rollout_id):
-        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
+        save_actor = (not args.use_critic) or (rollout_id >= args.num_critic_only_steps)
+
+        if save_actor:
             actor_model.save_model(
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
             )
+
         if args.use_critic:
             critic_model.save_model(
                 rollout_id,
                 force_sync=rollout_id == args.num_rollout - 1,
             )
+
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
 
