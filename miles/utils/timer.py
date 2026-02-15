@@ -17,6 +17,22 @@ _log_dir = os.environ.get("MILES_LOG_DIR", "")
 LOGFILE = os.path.join(_log_dir, "miles_timer") if _log_dir else "miles_timer"
 
 
+def _get_global_rank() -> int:
+    """Get global rank across all nodes. Falls back to local rank 0."""
+    if not torch.distributed.is_initialized():
+        return 0
+    return torch.distributed.get_rank()
+
+
+def _get_node_rank() -> int:
+    """Get node rank from environment, or -1 if unavailable."""
+    for env_var in ["NODE_RANK", "SLURM_NODEID"]:
+        val = os.environ.get(env_var)
+        if val is not None:
+            return int(val)
+    return -1
+
+
 class Timer(metaclass=SingletonMeta):
     def __init__(self):
         self.timers = {}
@@ -33,12 +49,16 @@ class Timer(metaclass=SingletonMeta):
         elapsed_time = time() - self.start_time[name]
         self.add(name, elapsed_time)
         del self.start_time[name]
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if rank == 0:
+        global_rank = _get_global_rank()
+        if global_rank == 0:
             if log_info:
                 logger.info(f"Timer {name} end (elapsed: {elapsed_time:.1f}s)")
-            with open(f"{LOGFILE}_{rank}.log", "a") as f:
-                f.write(f"Timer {name} end (elapsed: {elapsed_time*1000:.3f}ms)\n")
+            node_rank = _get_node_rank()
+            with open(f"{LOGFILE}_{global_rank}.log", "a") as f:
+                f.write(
+                    f"Timer {name} end (elapsed: {elapsed_time*1000:.3f}ms)"
+                    f" [node={node_rank} rank={global_rank}]\n"
+                )
 
     def reset(self, name=None):
         if name is None:
@@ -54,8 +74,9 @@ class Timer(metaclass=SingletonMeta):
 
     def log_experiment_start(self, config_dict: dict):
         """Log experiment start marker with configuration and timestamp."""
-        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        if rank == 0:
+        global_rank = _get_global_rank()
+        if global_rank == 0:
+            node_rank = _get_node_rank()
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             separator_line = "=" * 80
             config_lines = []
@@ -65,11 +86,12 @@ class Timer(metaclass=SingletonMeta):
             log_content = (
                 f"\n{separator_line}\n"
                 f"EXPERIMENT START: {timestamp}\n"
+                f"Node rank: {node_rank}, Global rank: {global_rank}\n"
                 f"Configuration:\n" + "\n".join(config_lines) + "\n"
                 f"{separator_line}\n\n"
             )
 
-            with open(f"{LOGFILE}_{rank}.log", "a") as f:
+            with open(f"{LOGFILE}_{global_rank}.log", "a") as f:
                 f.write(log_content)
 
     @contextmanager

@@ -3,22 +3,30 @@
 Script to consolidate consecutive duplicate timer entries in miles timer logs.
 Handles multiple types of gather operations by summing their latencies:
 - non_expert_all_tp_gather_source*
-- expert_all_gather_name_param_tp_gather* and expert_all_gather_name_param_ep_gather_source*
-  (these two are treated as the same group and squashed together)
+- expert_all_gather_name_param_tp_gather* (separate group)
+- expert_all_gather_name_param_ep_gather_source* (separate group)
+- load_weights_to_cpu_replica (consolidated)
+- rdma_submit (consolidated)
+- expert_convert_to_hf (consolidated)
 """
 
 import re
 import sys
 
 
-def parse_timer_line(line: str) -> tuple[str, float]:
-    """Parse a timer log line and extract the timer name and elapsed time."""
-    # Pattern: Timer <name> end (elapsed: <time>ms)
-    match = re.match(r"Timer (.+?) end \(elapsed: ([\d.]+)ms\)", line.strip())
+def parse_timer_line(line: str) -> tuple[str, float, str]:
+    """Parse a timer log line and extract the timer name, elapsed time, and optional metadata.
+
+    Returns:
+        (timer_name, elapsed_time, metadata_str) where metadata_str is e.g. '[step=1 node=0 rank=0]' or ''
+    """
+    # Pattern: Timer <name> end (elapsed: <time>ms) [step=... node=... rank=...]
+    match = re.match(r"Timer (.+?) end \(elapsed: ([\d.]+)ms\)(.*)$", line.strip())
     if match:
         timer_name = match.group(1)
         elapsed_time = float(match.group(2))
-        return timer_name, elapsed_time
+        metadata = match.group(3).strip()
+        return timer_name, elapsed_time, metadata
     else:
         raise ValueError(f"Unable to parse timer line: {line}")
 
@@ -33,13 +41,25 @@ def get_timer_group(timer_name: str) -> str | None:
     if timer_name.startswith("non_expert_all_tp_gather_source"):
         return "non_expert_all_tp_gather_source"
 
-    # Group 2: expert param gather operations (tp_gather and ep_gather treated as same)
-    expert_gather_patterns = [
-        "expert_all_gather_name_param_tp_gather",
-        "expert_all_gather_name_param_ep_gather_source",
-    ]
-    if any(timer_name.startswith(pattern) for pattern in expert_gather_patterns):
-        return "expert_all_gather_name_param_gather"
+    # Group 2: expert TP gather (separate from EP gather)
+    if timer_name.startswith("expert_all_gather_name_param_tp_gather"):
+        return "expert_all_gather_name_param_tp_gather"
+
+    # Group 3: expert EP gather (separate from TP gather)
+    if timer_name.startswith("expert_all_gather_name_param_ep_gather_source"):
+        return "expert_all_gather_name_param_ep_gather"
+
+    # Group 4: load_weights_to_cpu_replica (many calls per bucket)
+    if timer_name == "load_weights_to_cpu_replica":
+        return "load_weights_to_cpu_replica"
+
+    # Group 5: rdma_submit (many calls per bucket)
+    if timer_name == "rdma_submit":
+        return "rdma_submit"
+
+    # Group 6: expert_convert_to_hf (called per bucket)
+    if timer_name == "expert_convert_to_hf":
+        return "expert_convert_to_hf"
 
     return None
 
@@ -52,9 +72,12 @@ def is_consolidatable_timer(timer_name: str) -> bool:
     return get_timer_group(timer_name) is not None
 
 
-def format_timer_line(timer_name: str, elapsed_time: float) -> str:
+def format_timer_line(timer_name: str, elapsed_time: float, metadata: str = "") -> str:
     """Format a timer line with the given name and elapsed time."""
-    return f"Timer {timer_name} end (elapsed: {elapsed_time:.3f}ms)"
+    line = f"Timer {timer_name} end (elapsed: {elapsed_time:.3f}ms)"
+    if metadata:
+        line += f" {metadata}"
+    return line
 
 
 def consolidate_timer_log(input_file: str, output_file: str) -> None:
@@ -70,6 +93,19 @@ def consolidate_timer_log(input_file: str, output_file: str) -> None:
     current_group_name = None
     current_group_total = 0.0
     current_group_count = 0
+    current_group_metadata = ""
+
+    def flush_group():
+        nonlocal current_group_name, current_group_total, current_group_count, current_group_metadata
+        if current_group_name:
+            consolidated_lines.append(
+                format_timer_line(current_group_name, current_group_total, current_group_metadata)
+                + f" (consolidated {current_group_count} entries)"
+            )
+            current_group_name = None
+            current_group_total = 0.0
+            current_group_count = 0
+            current_group_metadata = ""
 
     for line in lines:
         line = line.strip()
@@ -77,18 +113,10 @@ def consolidate_timer_log(input_file: str, output_file: str) -> None:
             continue
 
         try:
-            timer_name, elapsed_time = parse_timer_line(line)
+            timer_name, elapsed_time, metadata = parse_timer_line(line)
         except ValueError:
             # If we can't parse the line, just keep it as is
-            if current_group_name:
-                # Flush any pending group
-                consolidated_lines.append(
-                    format_timer_line(current_group_name, current_group_total)
-                    + f" (consolidated {current_group_count} entries)"
-                )
-                current_group_name = None
-                current_group_total = 0.0
-                current_group_count = 0
+            flush_group()
             consolidated_lines.append(line)
             continue
 
@@ -102,36 +130,22 @@ def consolidate_timer_log(input_file: str, output_file: str) -> None:
                 current_group_count += 1
             else:
                 # Flush previous group if exists
-                if current_group_name:
-                    consolidated_lines.append(
-                        format_timer_line(current_group_name, current_group_total)
-                        + f" (consolidated {current_group_count} entries)"
-                    )
+                flush_group()
 
                 # Start new group
                 current_group_name = timer_group
                 current_group_total = elapsed_time
                 current_group_count = 1
+                current_group_metadata = metadata
         else:
             # Different timer - flush any pending group and add this line
-            if current_group_name:
-                consolidated_lines.append(
-                    format_timer_line(current_group_name, current_group_total)
-                    + f" (consolidated {current_group_count} entries)"
-                )
-                current_group_name = None
-                current_group_total = 0.0
-                current_group_count = 0
+            flush_group()
 
             # Add non-target timer as-is
-            consolidated_lines.append(format_timer_line(timer_name, elapsed_time))
+            consolidated_lines.append(format_timer_line(timer_name, elapsed_time, metadata))
 
     # Flush any remaining group
-    if current_group_name:
-        consolidated_lines.append(
-            format_timer_line(current_group_name, current_group_total)
-            + f" (consolidated {current_group_count} entries)"
-        )
+    flush_group()
 
     # Write consolidated output
     with open(output_file, "w") as f:
