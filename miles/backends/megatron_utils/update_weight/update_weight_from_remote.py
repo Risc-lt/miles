@@ -61,6 +61,34 @@ class UpdateWeightFromRemote:
             )
             self.update_weights_wrapped = self.update_weight_profiler.wrap(self.update_weights_implementation)
 
+        # Pre-allocated GPU buffer pool for EP all_gather, keyed by (shape, dtype).
+        # Avoids cudaMalloc contention with running NCCL kernels.
+        self._ep_alloc_warmed_up = False
+
+    def _warmup_ep_buffers(self, named_params_and_buffers: list[tuple[str, torch.Tensor]]) -> None:
+        """Pre-allocate and free GPU buffers to warm up the CUDA memory allocator.
+
+        By allocating (and immediately freeing) all the buffer shapes we'll need during EP all_gather,
+        the CUDA caching allocator caches these blocks. Subsequent torch.empty_like calls during the
+        actual EP all_gather loop then hit the allocator cache instead of calling cudaMalloc, which
+        avoids contention with running NCCL kernels.
+        """
+        if self._ep_alloc_warmed_up:
+            return
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        seen_shapes: set[tuple[torch.Size, torch.dtype]] = set()
+        for _name, param in named_params_and_buffers:
+            key = (param.data.shape, param.data.dtype)
+            if key not in seen_shapes:
+                seen_shapes.add(key)
+                # Allocate ep_size buffers to prime the allocator cache, then let them go
+                bufs = [
+                    torch.empty(key[0], dtype=key[1], device=torch.cuda.current_device())
+                    for _ in range(ep_size)
+                ]
+                del bufs
+        self._ep_alloc_warmed_up = True
+
     @abstractmethod
     def connect_rollout_engines(
         self, rollout_engines: Sequence[ActorHandle], rollout_engine_lock: ActorHandle
@@ -150,9 +178,24 @@ class UpdateWeightFromRemote:
 
     def _update_expert_weights(self, named_params_and_buffers: Sequence[tuple[str, torch.Tensor]]) -> None:
         pbar = tqdm(desc="[Update Expert Weights]", total=0) if self._is_source else None
+
+        # Materialize all expert params so we can collect names for a single all_gather_object
+        all_expert_params = list(named_params_and_buffers)
+        local_expert_names = [name for name, _ in all_expert_params]
+
+        # Single collective call for ALL expert names across EP ranks (replaces per-bucket calls)
+        ep_size = mpu.get_expert_model_parallel_world_size()
+        all_names_per_rank: list[list[str] | None] = [None] * ep_size
+        dist.all_gather_object(all_names_per_rank, local_expert_names, group=mpu.get_expert_model_parallel_group())
+        self._cached_all_expert_names = all_names_per_rank
+        self._expert_bucket_offset = 0
+
+        # Warm up CUDA allocator so empty_like in EP all_gather hits cache, not cudaMalloc
+        self._warmup_ep_buffers(all_expert_params)
+
         buffer_size = 0
         named_tensors = []
-        for name, param in named_params_and_buffers:
+        for name, param in all_expert_params:
             # transfer expert tensors
             assert ".experts." in name, "Function intended for expert params only."
             buffer_size = self._update_expert_weight_from_remote(name, param, named_tensors, buffer_size, pbar=pbar)
@@ -230,12 +273,18 @@ class UpdateWeightFromRemote:
         Gather EP → HF → broadcast. Clears buffer.
         """
         with timer(f"expert_all_gather_name_param_ep_gather_source_{self._is_source}", log_info=False):
-            names = [name for name, _ in named_tensors]
-            all_names = [None] * mpu.get_expert_model_parallel_world_size()
-            dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
+            bucket_size = len(named_tensors)
+            offset = self._expert_bucket_offset
+            self._expert_bucket_offset += bucket_size
+
+            # Slice from cached all-rank names (no collective call needed per bucket)
+            all_names = [
+                rank_names[offset : offset + bucket_size]
+                for rank_names in self._cached_all_expert_names
+            ]
 
             for names in all_names:
-                assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"
+                assert len(names) == bucket_size, f"mismatch names length: {len(names)} != {bucket_size}"
 
             all_gathered_params = [[] for _ in range(mpu.get_expert_model_parallel_world_size())]
             handles = []
