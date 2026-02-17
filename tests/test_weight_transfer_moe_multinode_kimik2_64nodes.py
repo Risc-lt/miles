@@ -59,18 +59,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        if not os.path.exists(f"/root/models/{MODEL_NAME}/config.json"):
-            U.exec_command(
-                f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}"
-            )
-        else:
-            print(f"Skipping model download: /root/models/{MODEL_NAME} already exists")
+        U.exec_command(
+            "hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/Kimi-K2-Instruct"
+        )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
-    # Set offline mode before convert_checkpoint to prevent HF from creating cache dirs
-    # or making network calls inside the (potentially symlinked) model directory
-    os.environ["HF_HUB_OFFLINE"] = "1"
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
     if not args.multinode:
         U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
