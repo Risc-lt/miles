@@ -59,9 +59,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        U.exec_command(
-            "hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/Kimi-K2-Instruct"
-        )
+        if not os.path.exists(f"/root/models/{MODEL_NAME}/config.json"):
+            U.exec_command(
+                f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}"
+            )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
     num_gpus = args.num_train_gpus + args.num_rollout_gpus

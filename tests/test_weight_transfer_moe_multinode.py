@@ -135,7 +135,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs, cfg: ModelConfig):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        U.exec_command(f"hf download {cfg.hf_repo} --local-dir /root/models/{cfg.model_name}")
+        if not os.path.exists(f"/root/models/{cfg.model_name}/config.json"):
+            U.exec_command(f"hf download {cfg.hf_repo} --local-dir /root/models/{cfg.model_name}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
 
