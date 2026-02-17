@@ -62,7 +62,7 @@ def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
         U.exec_command(
-            "hf download Kimi/Kimi-K2-Instruct --local-dir /root/models/Kimi-K2-Instruct"
+            "hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/Kimi-K2-Instruct"
         )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
