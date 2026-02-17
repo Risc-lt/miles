@@ -6,6 +6,7 @@ import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
 MODEL_NAME = "Kimi-K2-Instruct"
+MODEL_NAME_BF16 = "Kimi-K2-Instruct-bf16"
 MODEL_TYPE = "kimi-k2"
 import time
 
@@ -62,15 +63,17 @@ def prepare(args: ScriptArgs):
         U.exec_command(
             f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}"
         )
+        # Kimi-K2-Instruct is FP8 quantized; convert to BF16 so mbridge can load weights
+        U.fp8_cast_bf16(f"/root/models/{MODEL_NAME}", f"/root/models/{MODEL_NAME_BF16}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
     if not args.multinode:
-        U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
+        U.convert_checkpoint(model_name=MODEL_NAME_BF16, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
     else:
         # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
         U.convert_checkpoint(
-            model_name=MODEL_NAME,
+            model_name=MODEL_NAME_BF16,
             megatron_model_type=MODEL_TYPE,
             num_gpus_per_node=GPUS_PER_NODE,
             multinode=True,
@@ -111,16 +114,16 @@ def execute(args: ScriptArgs):
     if args.multinode:
         num_gpus_per_node = 8
         ckpt_args = (
-            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
-            f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
+            f"--hf-checkpoint /root/models/{MODEL_NAME_BF16}/ "
+            f"--ref-load /root/multinode/{MODEL_NAME_BF16}_torch_dist/ "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
         ckpt_args = (
-            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
-            f"--ref-load /root/{MODEL_NAME}_torch_dist "
-            f"--load /root/{MODEL_NAME}_slime "
-            f"--save /root/{MODEL_NAME}_slime "
+            f"--hf-checkpoint /root/models/{MODEL_NAME_BF16}/ "
+            f"--ref-load /root/{MODEL_NAME_BF16}_torch_dist "
+            f"--load /root/{MODEL_NAME_BF16}_slime "
+            f"--save /root/{MODEL_NAME_BF16}_slime "
         )
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
     if args.no_save_optim:
