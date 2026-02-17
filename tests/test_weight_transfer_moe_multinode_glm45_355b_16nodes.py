@@ -17,9 +17,11 @@ import os
 class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["nccl", "rdma"] = "nccl"
     # Training parallelism (matches run_glm45_355b_a32b.py for 8 train nodes)
-    train_tp: int = 4
+    # PP=4,TP=8 so each worker only needs 1 CPU replica for RDMA weight transfer
+    # (PP=8,TP=4 required 2 replicas per worker, causing CPU OOM)
+    train_tp: int = 8
     train_ep: int = 8
-    train_pp: int = 8
+    train_pp: int = 4
     train_cp: int = 2
     train_etp: int = 1
     # Rollout parallelism: 2 engines × 32 GPUs each (EP=32, DP_attn=4)
