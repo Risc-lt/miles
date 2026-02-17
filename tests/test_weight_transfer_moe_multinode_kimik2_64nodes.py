@@ -79,6 +79,7 @@ def prepare(args: ScriptArgs):
             dir_dst="/root/multinode",
             node_rank=args.node_rank,
             decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+            extra_args=" --expert-model-parallel-size 8",
         )
 
 
