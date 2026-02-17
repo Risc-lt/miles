@@ -16,7 +16,6 @@ srun --jobid=${JOBID} --nodes=4 --ntasks-per-node=1 --overlap bash -c "
     LOG_DIR='/data/logs/4node-profile/${EXEC_DATE}-${EXP}'
     mkdir -p \\\$LOG_DIR
     export MILES_LOG_DIR=\\\$LOG_DIR
-    export HF_HUB_OFFLINE=1
 
     cd /root/miles
     git fetch lt --quiet && git reset --hard lt/jd/rdma-cpu-replica-direct

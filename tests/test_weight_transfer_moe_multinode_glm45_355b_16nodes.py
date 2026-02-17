@@ -5,7 +5,7 @@ import typer
 import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
-MODEL_NAME = "GLM-4.5-355B-A32B"
+MODEL_NAME = "GLM-4.5"
 MODEL_TYPE = "glm4.5-355B-A32B"
 import time
 
@@ -58,7 +58,7 @@ def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
         U.exec_command(
-            "hf download THUDM/GLM-4.5-355B-A32B --local-dir /root/models/GLM-4.5-355B-A32B"
+            "hf download zai-org/GLM-4.5 --local-dir /root/models/GLM-4.5"
         )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
