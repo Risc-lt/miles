@@ -33,8 +33,6 @@ class ScriptArgs(U.ExecuteTrainConfig):
     num_rollout_gpus: int = 64  # 8 nodes * 8 GPUs for rollout
     # Optimizations
     pipelined_transfer: bool = False  # Legacy field, pipelining is always on for RDMA
-    # Profiling
-    use_pytorch_profiler_update_weight: bool = False
     # multi-node settings
     multinode: bool = True
     head_node_ip: str | None = None
@@ -135,7 +133,7 @@ def execute(args: ScriptArgs):
         "--apply-chat-template "
         "--rollout-shuffle "
         "--rm-type deepscaler "
-        "--num-rollout 12 "
+        "--num-rollout 13 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
         "--rollout-max-response-len 100 "
@@ -231,14 +229,6 @@ def execute(args: ScriptArgs):
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
 
-    profile_args = ""
-    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
-    profile_args += (
-        "--use-pytorch-profiler-update-weight "
-        "--profile-update-weight-start 2 "
-        "--profile-update-weight-end 3 "
-        f"--tensorboard-dir {log_dir}/{args.mode}_profiler_logs/ "
-    )
     train_args = (
         f"{ckpt_args} "
         f"{rollout_args} "
