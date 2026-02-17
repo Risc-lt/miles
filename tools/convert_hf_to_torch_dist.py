@@ -100,6 +100,7 @@ def main():
         device_id=torch.device(f"cuda:{local_rank}"),
     )
     args = get_args()
+    print(f"adrgs {args}")
     init(args)
     model = get_model(get_model_provider_func(args), ModelType.encoder_or_decoder, wrap_with_ddp=False)
 
