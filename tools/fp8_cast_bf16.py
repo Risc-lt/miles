@@ -30,13 +30,18 @@ def weight_dequant(x: torch.Tensor, s: torch.Tensor, block_size: int = 128) -> t
     assert x.is_contiguous() and s.is_contiguous()
     assert x.dim() == 2 and s.dim() == 2
     M, N = x.size()
-    y = torch.empty_like(x, dtype=torch.get_default_dtype())
+    # Move to GPU for Triton kernel, then back to CPU to save memory
+    x_cuda = x.cuda()
+    s_cuda = s.cuda()
+    y = torch.empty(M, N, dtype=torch.get_default_dtype(), device="cuda")
 
     def grid(meta):
         return (triton.cdiv(M, meta["BLOCK_SIZE"]), triton.cdiv(N, meta["BLOCK_SIZE"]))
 
-    weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
-    return y
+    weight_dequant_kernel[grid](x_cuda, s_cuda, y, M, N, BLOCK_SIZE=block_size)
+    result = y.cpu()
+    del x_cuda, s_cuda, y
+    return result
 
 
 def main(fp8_path, bf16_path):
@@ -60,7 +65,7 @@ def main(fp8_path, bf16_path):
         file_name = weight_map[tensor_name]
         if file_name not in loaded_files:
             file_path = os.path.join(fp8_path, file_name)
-            loaded_files[file_name] = load_file(file_path, device="cuda")
+            loaded_files[file_name] = load_file(file_path, device="cpu")
         return loaded_files[file_name][tensor_name]
 
     safetensor_files = list(glob(os.path.join(fp8_path, "*.safetensors")))
@@ -68,7 +73,7 @@ def main(fp8_path, bf16_path):
     for safetensor_file in tqdm(safetensor_files):
         print(f"Handling file: {safetensor_file}")
         file_name = os.path.basename(safetensor_file)
-        current_state_dict = load_file(safetensor_file, device="cuda")
+        current_state_dict = load_file(safetensor_file, device="cpu")
         loaded_files[file_name] = current_state_dict
 
         new_state_dict = {}
