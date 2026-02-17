@@ -15,8 +15,6 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
 
     LOG_DIR='/data/logs/glm355b/${EXEC_DATE}-${EXP}'
     mkdir -p \\\$LOG_DIR
-    export MILES_LOG_DIR=\\\$LOG_DIR
-    export HF_TOKEN=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 
 
     cd /root/miles
     git fetch lt --quiet && git reset --hard lt/jd/rdma-cpu-replica-direct
