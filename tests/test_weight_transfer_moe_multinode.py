@@ -52,13 +52,6 @@ class ModelConfig:
 
 
 MODELS: dict[str, ModelConfig] = {
-    "llama3": ModelConfig(
-        key="llama3",
-        model_name="Llama-3.1-8B-Instruct",
-        hf_repo="meta-llama/Llama-3.1-8B-Instruct",
-        model_type="llama3.1-8B-Instruct",
-        train_tp=2, train_ep=1,
-    ),
     "glm4": ModelConfig(
         key="glm4",
         model_name="GLM-Z1-9B-0414",
