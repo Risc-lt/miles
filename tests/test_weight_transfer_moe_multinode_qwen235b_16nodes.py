@@ -58,10 +58,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        if not os.path.exists(f"/root/models/{MODEL_NAME}/config.json"):
-            U.exec_command(
-                "hf download Qwen/Qwen3-235B-A22B-Instruct-2507 --local-dir /root/models/Qwen3-235B-A22B-Instruct-2507"
-            )
+        U.exec_command(
+            "hf download Qwen/Qwen3-235B-A22B-Instruct-2507 --local-dir /root/models/Qwen3-235B-A22B-Instruct-2507"
+        )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
         # hf download --repo-type dataset zhuzilin/aime-2024

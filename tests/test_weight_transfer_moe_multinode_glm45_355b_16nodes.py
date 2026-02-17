@@ -57,10 +57,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        if not os.path.exists(f"/root/models/{MODEL_NAME}/config.json"):
-            U.exec_command(
-                "hf download zai-org/GLM-4.5 --local-dir /root/models/GLM-4.5"
-            )
+        U.exec_command(
+            "hf download zai-org/GLM-4.5 --local-dir /root/models/GLM-4.5"
+        )
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
