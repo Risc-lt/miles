@@ -186,6 +186,11 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 default=4,
                 help="Number of threadpool workers for pipelined D2H + RDMA transfers.",
             )
+            parser.add_argument(
+                "--rdma-shared-buffer",
+                action="store_true",
+                help="Use shared CPU pinned buffer for RDMA weight transfer (reduces CPU memory 8×).",
+            )
 
             return parser
 
