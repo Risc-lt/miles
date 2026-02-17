@@ -79,7 +79,7 @@ def prepare(args: ScriptArgs):
             master_addr=args.head_node_ip,
             nnodes=args.nnodes,
             dir_dst="/root/multinode",
-            hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16"
+            hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16",
             node_rank=args.node_rank,
             decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
         )
