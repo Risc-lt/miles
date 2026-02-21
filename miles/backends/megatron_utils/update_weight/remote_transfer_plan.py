@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 import torch
+import torch.distributed as dist
 from megatron.core import mpu
 
 logger = logging.getLogger(__name__)
@@ -31,20 +32,18 @@ class TransferTaskP2PMeta:
 
 class RemoteTransferPlan:
     """
-    Plans and manages remote weight transfers for both NCCL and RDMA backends, assuming static training and rollout placements.
+    Plans and manages remote weight transfers for both NCCL and RDMA backends,
+    assuming static training and rollout placements.
 
-    At the moment, the plan assumes an all-gather in the tp/ep dimension on a bucketed basis.
+    Key insight: the bucketed weight update all-gathers across TP/EP/ETP dimensions,
+    so after all-gather every rank sharing the same PP rank holds a complete weight
+    replica. The only remaining source-side parallelism axis is PP.
 
-    NCCL Plan: Use a single broadcast from DP=TP=0 PP rank to all rollout engines in a new process group.
-    RDMA P2P Plan:
-    The current execution plan prioritizes simplicity and general applicability for all supported models. It reuses existing
-    componenets of miles distributed update as well as sglang remote instance load mechanisms. The plan follows:
-    1. Calculate total number of source full replica (up to pp dimension) after all-gather in tp/ep dimension, for both
-        expert and non-expert parameters.
-    2. For each rollout engine, assign source ranks in a round-robin manner for both expert and non-expert parameters.
-    3. During initialization, query each target rollout engine ranks for remote parameter names and session identifiers.
-    4. Generate transfer tasks for each source rank based on remote parameter and local parameter availability.
+        gathered_dp_size = world_size / pp_size
+        gathered_dp_rank = unique index [0, gathered_dp_size) per PP stage
 
+    NCCL Plan: Broadcast from gathered_dp_rank=0 per PP stage to all rollout engines.
+    RDMA P2P Plan: Round-robin assign gathered_dp_ranks to rollout (engine, rank) targets.
     """
 
     def __init__(
@@ -62,66 +61,65 @@ class RemoteTransferPlan:
 
     def _get_parallelism(self, args: Namespace) -> None:
         """
-        Collecting and printing out parallelism information for both source (trainer) and target (rollout engines).
-        Also print out the parallelism information after the ep/tp all-gather for the 2 parameter groups.
+        Collect parallelism information for source (trainer) and target (rollout engines).
+
+        After the bucketed all-gather across TP/EP/ETP dimensions, every rank sharing
+        the same PP rank holds a complete weight replica. So the effective source
+        parallelism is simply: all ranks with the same PP rank.
+
+            gathered_dp_size = world_size / pp_size
+            gathered_dp_rank = unique index [0, gathered_dp_size) within that group
         """
 
-        # Gather the source (current trainer) information.
-        self._pp_rank, self._pp_size = (
-            mpu.get_pipeline_model_parallel_rank(),
-            mpu.get_pipeline_model_parallel_world_size(),
-        )
-        self._ep_rank, self._ep_size = mpu.get_expert_model_parallel_rank(), mpu.get_expert_model_parallel_world_size()
-        self._tp_rank, self._tp_size = mpu.get_tensor_model_parallel_rank(), mpu.get_tensor_model_parallel_world_size()
-        self._etp_rank, self._etp_size = (
-            mpu.get_expert_tensor_parallel_rank(),
-            mpu.get_expert_tensor_parallel_world_size(),
-        )
-        self._dp_rank, self._dp_size = mpu.get_data_parallel_rank(
-            with_context_parallel=True
-        ), mpu.get_data_parallel_world_size(with_context_parallel=True)
-        self._edp_rank, self._edp_size = mpu.get_expert_data_parallel_rank(), mpu.get_expert_data_parallel_world_size()
+        # Source (trainer) PP information.
+        self._pp_rank = mpu.get_pipeline_model_parallel_rank()
+        self._pp_size = mpu.get_pipeline_model_parallel_world_size()
 
-        # Gather the target (rollout engine count and parallelism) information.
+        # After all-gather in TP/EP/ETP, all non-PP dimensions collapse into
+        # one flat "gathered DP" group per PP rank.
+        world_size = dist.get_world_size()
+        self._size = world_size // self._pp_size
+
+        # Rank within the gathered DP group.
+        # Each PP group has pp_size members (one per PP stage) at the same
+        # DP/TP/EP/CP position.  The minimum global rank in a PP group uniquely
+        # identifies that "column".  We gather all column IDs, sort them, and
+        # our position in the sorted list is our gathered_dp_rank.
+        # This is O(world_size) but only runs once during init.
+        global_rank = dist.get_rank()
+        my_pp_group = dist.get_process_group_ranks(mpu.get_pipeline_model_parallel_group())
+        my_column_id = min(my_pp_group)
+
+        all_column_ids = [None] * world_size
+        dist.all_gather_object(all_column_ids, my_column_id)
+        # Deduplicate and sort to get the ordered list of columns.
+        sorted_columns = sorted(set(all_column_ids))
+        self._rank = sorted_columns.index(my_column_id)
+
+        # Target (rollout engine) parallelism.
         self._rollout_tp_size = args.sglang_tp_size
         self._rollout_dp_size = args.sglang_dp_size
         self._rollout_ep_size = args.sglang_ep_size
         self._rollout_attn_tp_size = self._rollout_tp_size // self._rollout_dp_size
         self._rollout_moe_tp_size = self._rollout_tp_size // self._rollout_ep_size
 
-        # EP and PP sizes are not tested and likely miss functionalities.
         self._rollout_pp_size = args.sglang_pp_size
         if self._rollout_pp_size != 1:
-            raise NotImplementedError("Rollout expert and pipeline parallelisms are not supported yet.")
+            raise NotImplementedError("Rollout pipeline parallelism is not supported yet.")
         self._rollout_num_gpu_per_engine = args.rollout_num_gpus_per_engine
         self._rollout_engine_count = args.rollout_num_gpus // self._rollout_num_gpu_per_engine
         self._rollout_num_gpus = args.rollout_num_gpus
-        logger.info(
-            f"RemoteTransferPlan initialized: mode={self.mode}, pp_rank={self._pp_rank}/{self._pp_size}, tp_rank={self._tp_rank}/{self._tp_size}, "
-            f"ep_rank={self._ep_rank}/{self._ep_size}, etp_rank={self._etp_rank}/{self._etp_size}, dp_rank={self._dp_rank}/{self._dp_size}"
-        )
-        logger.info(
-            f"Rollout engine count: {self._rollout_engine_count}, tp_size={self._rollout_tp_size}, ep_size={self._rollout_ep_size}, dp_size={self._rollout_dp_size}"
-        )
-        # Calculate the non-expert dp/ expert dp from training side
-        # Reference: `Megatron-LM/megatron/core/parallel_state.py`
 
-        self._gathered_dp_size = self._dp_size * self._tp_size
-        self._gathered_dp_rank = self._dp_rank * self._tp_size + self._tp_rank
-        expert_tp_size = self._ep_size * self._etp_size
-        self._gathered_expert_dp_size = self._edp_size * expert_tp_size
-        self._gathered_expert_dp_rank = (
-            self._edp_rank * expert_tp_size + self._ep_rank * self._etp_size + self._etp_rank
+        logger.info(
+            f"RemoteTransferPlan initialized: mode={self.mode}, "
+            f"pp_rank={self._pp_rank}/{self._pp_size}, "
+            f"gathered_dp_rank={self._rank}/{self._size} (global_rank={global_rank})"
         )
         logger.info(
-            f"Gathered dp_size={self._gathered_dp_size}, gathered expert dp_size={self._gathered_expert_dp_size}"
+            f"Rollout engine count: {self._rollout_engine_count}, "
+            f"tp_size={self._rollout_tp_size}, ep_size={self._rollout_ep_size}, "
+            f"dp_size={self._rollout_dp_size}"
         )
-        logger.info(
-            f"Gathered dp_rank={self._gathered_dp_rank}, gathered expert dp_rank={self._gathered_expert_dp_rank}"
-        )
-
-        self._rank = self._gathered_dp_rank
-        self._size = self._gathered_dp_size
 
     def get_nccl_group(self) -> str:
         """
@@ -215,10 +213,7 @@ class RemoteTransferPlan:
             bool - True if the current rank is a source for weight transfer, False otherwise.
         """
         if self.mode == "nccl":
-            # NCCL only load from DP=TP=0 PP ranks to all rollout engines.
-            return (
-                mpu.get_data_parallel_rank(with_context_parallel=True) == 0
-                and mpu.get_tensor_model_parallel_rank() == 0
-            )
-        # Only case where RDMA P2P is not sending is when the current DP rank is >= total number of rollout GPUs.
-        return False if (self._rank >= self._rollout_num_gpus) else True
+            # NCCL broadcasts from gathered_dp_rank=0 per PP stage.
+            return self._rank == 0
+        # RDMA P2P: every gathered_dp_rank that maps to a rollout GPU is a source.
+        return self._rank < self._rollout_num_gpus
