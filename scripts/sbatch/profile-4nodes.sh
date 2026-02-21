@@ -1,6 +1,6 @@
+JOBID=5275751
 EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP=cpu-direct-4node
-JOBID=5272988
 
 srun --jobid=${JOBID} --nodes=4 --ntasks-per-node=1 --overlap bash -c "
     pid=\$(enroot list -f | grep 'pyxis_${JOBID}' -A 1 | awk '\$2 ~ /^[0-9]+\$/ {print \$2; exit}')
@@ -18,15 +18,15 @@ srun --jobid=${JOBID} --nodes=4 --ntasks-per-node=1 --overlap bash -c "
     export MILES_LOG_DIR=\\\$LOG_DIR
 
     cd /root/miles
-    git fetch lt --quiet && git reset --hard lt/jd/rdma-cpu-replica-direct
+    git fetch lt --quiet && git reset --hard lt/jd/rdma-sharable-cpu-replica
 
     # Clean stale profiler traces before run
     rm -rf /root/rdma_profiler_logs
 
-    # Runs all 4 models (glm4, moonlight, qwen3-30b, qwen3-32b) x both modes (nccl, rdma)
+    # Runs all 4 models (glm4, moonlight, qwen3-30b, qwen3-32b) x 3 modes (nccl, rdma, rdma-shared)
     # Results stored in: \\\$LOG_DIR/4node-profile/<model>/<mode>/
     python /root/miles/tests/test_weight_transfer_moe_multinode.py \\
-        --multinode --mode both \\
+        --multinode --mode all \\
         --head-node-ip \\\$HEAD_NODE_IP --nnodes \\\$NNODES --node-rank \\\$NODE_RANK \\
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after --bucket-size 1 \\
         2>&1 | tee \\\$LOG_DIR/node_\\\$NODE_RANK.log

@@ -1,14 +1,15 @@
 """
 Multi-model 4-node profiling script for RDMA/NCCL weight transfer.
 
-Runs 5 model configs sequentially (both NCCL and RDMA modes), writing timer
-logs under $MILES_LOG_DIR/4node-profile/<model>/<mode>/. Runs 13 steps;
-average the last 10 for stable profiling numbers.
+Runs 5 model configs sequentially (NCCL, RDMA, and/or RDMA shared-buffer modes),
+writing timer logs under $MILES_LOG_DIR/4node-profile/<model>/<mode>/.
+Runs 13 steps; average the last 10 for stable profiling numbers.
 
 Usage:
     python test_weight_transfer_moe_multinode.py \
         --multinode --head-node-ip <IP> --node-rank <RANK> --nnodes 4 \
-        [--mode nccl|rdma|both] [--models llama3,glm4,moonlight,qwen3-30b,qwen3-32b]
+        [--mode nccl|rdma|rdma-shared|both|all] \
+        [--models llama3,glm4,moonlight,qwen3-30b,qwen3-32b]
 """
 
 from dataclasses import dataclass, field
@@ -93,7 +94,7 @@ ALL_MODEL_KEYS = list(MODELS.keys())
 # ---------------------------------------------------------------------------
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    mode: Literal["nccl", "rdma", "both"] = "both"
+    mode: Literal["nccl", "rdma", "rdma-shared", "both", "all"] = "all"
     models: str = ",".join(ALL_MODEL_KEYS)  # comma-separated model keys
     # Multi-node settings
     multinode: bool = True
@@ -126,7 +127,12 @@ class ScriptArgs(U.ExecuteTrainConfig):
         return out
 
     def selected_modes(self) -> list[str]:
-        return ["nccl", "rdma"] if self.mode == "both" else [self.mode]
+        if self.mode == "both":
+            return ["nccl", "rdma"]
+        elif self.mode == "all":
+            return ["nccl", "rdma", "rdma-shared"]
+        else:
+            return [self.mode]
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +162,8 @@ def prepare(args: ScriptArgs, cfg: ModelConfig):
 # Execute one (model, mode) pair
 # ---------------------------------------------------------------------------
 def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
+    is_rdma = mode in ("rdma", "rdma-shared")
+
     log_dir = os.environ.get("MILES_LOG_DIR", "/root")
     run_log_dir = f"{log_dir}/4node-profile/{cfg.key}/{mode}"
     os.makedirs(run_log_dir, exist_ok=True)
@@ -242,13 +250,13 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
     )
     if cfg.sglang_ep > 1:
         sglang_args += "--sglang-enable-dp-attention --sglang-enable-dp-lm-head "
-    if mode == "rdma":
+    if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
 
     # --- Misc ---
     mem = (
         int(args.bucket_size * 1024 * 1024 * 1024)
-        if mode == "rdma"
+        if is_rdma
         else (4 * 1024 * 1024 * 1024)
     )
     misc_args = (
@@ -260,8 +268,10 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
         f"--update-weight-buffer-size {mem} "
         "--check-weight-update-equal "
     )
-    if mode == "rdma":
+    if is_rdma:
         misc_args += "--update-weight-transfer-mode rdma "
+    if mode == "rdma-shared":
+        misc_args += "--rdma-shared-buffer "
     misc_args += cfg.extra_train_flags
 
 
@@ -302,7 +312,7 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
     )
 
     if args.node_rank > 0 and args.wait_after:
-        time.sleep(800 if mode == "nccl" else 3600)
+        time.sleep(800 if mode == "nccl" else 3600)  # rdma/rdma-shared need more time
 
 
 # ---------------------------------------------------------------------------

@@ -183,8 +183,10 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--rdma-transfer-workers",
                 type=int,
-                default=4,
-                help="Number of threadpool workers for pipelined D2H + RDMA transfers.",
+                default=8,
+                help="Number of threadpool workers for async RDMA transfers. "
+                "RDMA writes are NIC-bound, so more threads = more concurrent NIC utilization. "
+                "Default 8 matches typical 8 GPUs/node (one thread per engine rank).",
             )
             parser.add_argument(
                 "--rdma-shared-buffer",

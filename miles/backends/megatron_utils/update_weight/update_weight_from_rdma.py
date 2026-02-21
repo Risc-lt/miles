@@ -26,7 +26,6 @@ from .update_weight_from_remote import UpdateWeightFromRemote
 
 logger = logging.getLogger(__name__)
 
-
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
     valid_fields = {f.name for f in dataclasses.fields(ServerArgs)}
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
@@ -55,34 +54,112 @@ def register_cpu_memory_region(params_dict: dict, transfer_engine: TransferEngin
     return weight_mr_dict
 
 
+def create_transfer_engine() -> TransferEngine:
+    transfer_engine = TransferEngine()
+    local_ip = ray._private.services.get_node_ip_address()
+    transfer_engine.initialize(local_ip, "P2PHANDSHAKE", "rdma", "")
+    logger.info(f"[RDMA] Transfer Engine initialized at port {transfer_engine.get_rpc_port()}")
+    return transfer_engine
+
+
+def create_cpu_replica(
+    parallelism_config: RankParallelismConfig,
+    model_path: str,
+    server_args: ServerArgs,
+) -> torch.nn.Module:
+    """Create model on GPU (required by sglang), then move to CPU pinned memory."""
+    load_config = LoadConfig(
+        load_format="auto",
+        model_loader_extra_config=server_args.model_loader_extra_config,
+        rl_quant_profile=server_args.rl_quant_profile,
+    )
+    server_args_module._global_server_args = server_args
+    with ParallelismContext(parallelism_config):
+        model = get_model(
+            model_config=ModelConfig(model_path),
+            load_config=load_config,
+            device_config=DeviceConfig(),
+        )
+
+    gpu_params = sum(p.numel() for p in model.parameters())
+    logger.info(f"[RDMA] GPU model created: {gpu_params} params")
+
+    # Move all parameters to CPU pinned memory
+    with timer("rdma_move_replica_to_cpu"):
+        for param in model.parameters():
+            cpu_data = param.data.to("cpu", non_blocking=True).pin_memory()
+            param.data = cpu_data
+        torch.cuda.synchronize()
+
+    torch.cuda.empty_cache()
+
+    total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
+    logger.info(
+        f"[RDMA] CPU pinned replica: {gpu_params} params, "
+        f"{total_bytes / (1024**3):.2f} GB"
+    )
+    print_memory("[RDMA] After moving replica to CPU and freeing GPU")
+    return model
+
+
+def query_remote_weight_infos(
+    rollout_engines: Sequence[ActorHandle],
+    targets,
+) -> tuple[dict, dict, dict]:
+    """Query remote rollout engines for weight info, session IDs, and server args.
+
+    Returns:
+        (remote_weight_infos_by_session_id, targets_to_session_id, session_id_to_server_args)
+    """
+    remote_weight_infos_by_session_id = {}
+    targets_to_session_id = {}
+    session_id_to_server_args = {}
+    targets_to_query = set((target.engine_ind, target.engine_rank) for target in targets)
+
+    for engine_ind, engine_rank in targets_to_query:
+        session_id, weights_info = ray.get(
+            rollout_engines[engine_ind].get_remote_instance_transfer_engine_info.remote(rank=engine_rank)
+        )
+        parallelism_info = ray.get(
+            rollout_engines[engine_ind].get_parallelism_info.remote(rank=engine_rank)
+        )
+
+        session_id_to_server_args[session_id] = create_server_args_from_dict(
+            ray.get(rollout_engines[engine_ind].get_server_info.remote())
+        )
+        assert session_id is not None, (
+            f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
+        )
+        logger.info(
+            f"[RDMA] Obtained remote {session_id} info from rollout engine {engine_ind} rank {engine_rank}"
+        )
+        logger.info(f"[RDMA] Remote weight info has {len(weights_info)} tensors.")
+        remote_weight_infos_by_session_id[session_id] = (weights_info, parallelism_info)
+        targets_to_session_id[(engine_ind, engine_rank)] = session_id
+
+    return remote_weight_infos_by_session_id, targets_to_session_id, session_id_to_server_args
+
+
 @dataclasses.dataclass
 class RemoteWeightInfo:
     session_id: str
     weights_info: dict[str, tuple[int, int, int]]  # name -> (remote_address, numel, element_size)
 
 
-@dataclasses.dataclass
-class EngineRankInfo:
-    """Per-engine-rank metadata for shared-buffer mode."""
-
-    engine_rank: int
-    model_replica: torch.nn.Module  # shares CPU pinned buffers, has unique weight_loaders
-    remote_weight_infos: list[RemoteWeightInfo]
-
-    def add_remote_session(self, remote_info: RemoteWeightInfo) -> None:
-        self.remote_weight_infos.append(remote_info)
+# ---------------------------------------------------------------------------
+# Per-replica async RDMA transfer
+# ---------------------------------------------------------------------------
 
 
 class RDMATransferManager:
-    """Manages async RDMA writes from CPU pinned memory to remote GPUs.
+    """Generic async task manager for RDMA writes.
 
-    The model replica lives on CPU as pinned memory. load_weights() writes
-    directly into it (GPU tensors are implicitly D2H-copied by .copy_()).
-    After load_weights, we submit RDMA writes from CPU to remote GPUs in
-    background threads — no GPU involvement at all.
+    Accepts arbitrary callables via submit(), runs them in a thread pool,
+    and tracks futures for bulk waiting. Used by both per-replica and
+    shared-buffer RDMA variants — each passes its own write function.
     """
 
-    def __init__(self, num_workers: int = 4):
+    def __init__(self, num_workers: int = 8):
         self.num_workers = num_workers
         self.executor: ThreadPoolExecutor | None = None
         self.transfer_futures: list[Future] = []
@@ -91,52 +168,14 @@ class RDMATransferManager:
         if self.executor is None:
             self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
 
-    def submit_for_transfer(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """Submit RDMA writes for ready parameters. CPU memory is already populated."""
-        if not names:
-            return
+    def submit(self, fn: Callable, *args) -> None:
+        """Submit a callable to the thread pool."""
         self.ensure_started()
-        future = self.executor.submit(self._do_rdma_write, bundle, names)
+        future = self.executor.submit(fn, *args)
         self.transfer_futures.append(future)
 
-    def _do_rdma_write(self, bundle: "TransferBundle", names: list[str]) -> None:
-        """RDMA write from CPU pinned memory to remote GPUs. Runs in threadpool."""
-        source_ptrs, source_lens = [], []
-        valid_names = []
-
-        for name in names:
-            cpu_reg = bundle.weight_memory_registry.get(name)
-            if cpu_reg is None:
-                logger.warning(f"[RDMA] Parameter {name} not in weight registry")
-                continue
-
-            data_ptr, numel, ele_size = cpu_reg
-            source_ptrs.append(data_ptr)
-            source_lens.append(numel * ele_size)
-            valid_names.append(name)
-
-        if not source_ptrs:
-            return
-
-        for remote_session in bundle.remote_weight_infos:
-            session_id = remote_session.session_id
-            remote_weights_info = remote_session.weights_info
-
-            target_ptrs = []
-            for name in valid_names:
-                if name in remote_weights_info:
-                    target_ptrs.append(remote_weights_info[name][0])
-
-            if len(target_ptrs) != len(source_ptrs):
-                logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
-                continue
-
-            ret = bundle.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-            if ret < 0:
-                logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
-
     def wait_transfers(self) -> None:
-        """Wait for all RDMA writes to complete."""
+        """Wait for all submitted tasks to complete."""
         for future in self.transfer_futures:
             try:
                 future.result(timeout=30.0)
@@ -151,8 +190,8 @@ class TransferBundle:
     """Holds a CPU pinned model replica and its RDMA transfer state.
 
     The model replica lives permanently on CPU as pinned memory. load_weights()
-    writes directly into it — sglang's weight loaders use .copy_() which
-    handles GPU→CPU transfer implicitly. No GPU replica, no offload/re-onload.
+    writes directly into it -- sglang's weight loaders use .copy_() which
+    handles GPU->CPU transfer implicitly. No GPU replica, no offload/re-onload.
     """
 
     model_replica: torch.nn.Module  # lives on CPU (pinned memory)
@@ -175,6 +214,45 @@ class TransferBundle:
 
     def add_remote_session(self, remote_info: RemoteWeightInfo) -> None:
         self.remote_weight_infos.append(remote_info)
+
+    def do_rdma_write(self, names: list[str]) -> None:
+        """RDMA write from CPU pinned memory to remote GPUs.
+
+        Suitable for submission to RDMATransferManager.submit().
+        """
+        source_ptrs, source_lens = [], []
+        valid_names = []
+
+        for name in names:
+            cpu_reg = self.weight_memory_registry.get(name)
+            if cpu_reg is None:
+                logger.warning(f"[RDMA] Parameter {name} not in weight registry")
+                continue
+
+            data_ptr, numel, ele_size = cpu_reg
+            source_ptrs.append(data_ptr)
+            source_lens.append(numel * ele_size)
+            valid_names.append(name)
+
+        if not source_ptrs:
+            return
+
+        for remote_session in self.remote_weight_infos:
+            session_id = remote_session.session_id
+            remote_weights_info = remote_session.weights_info
+
+            target_ptrs = []
+            for name in valid_names:
+                if name in remote_weights_info:
+                    target_ptrs.append(remote_weights_info[name][0])
+
+            if len(target_ptrs) != len(source_ptrs):
+                logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
+                continue
+
+            ret = self.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
+            if ret < 0:
+                logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
     def get_transfer_ready_params(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> list[str]:
         """Track which parameters are ready (all shards loaded)."""
@@ -207,17 +285,23 @@ class TransferBundle:
         return transfer_ready_params
 
 
+# ---------------------------------------------------------------------------
+# UpdateWeightFromRDMA: per-replica, async threaded RDMA writes
+# ---------------------------------------------------------------------------
+
+
 class UpdateWeightFromRDMA(UpdateWeightFromRemote):
-    """RDMA weight transfer using a CPU pinned model replica.
+    """RDMA weight transfer using independent CPU pinned model replicas per engine rank.
 
     Architecture:
-    - Model replica lives on CPU as pinned memory (created once, persists across iterations)
-    - load_weights() writes directly into CPU pinned params (GPU→CPU via implicit .copy_())
-    - RDMA writes from CPU pinned memory to remote rollout GPUs
+    - One CPU pinned model replica per engine rank (created once, persists across iterations)
+    - One TransferEngine per engine rank
+    - load_weights() writes directly into CPU pinned params (GPU->CPU via implicit .copy_())
+    - Async RDMA writes from CPU pinned memory to remote rollout GPUs via thread pool
     - No GPU replica, no offload/re-onload cycle, no GPU memory pressure
 
     Per-iteration flow:
-      per bucket:  all-gather(GPU) → load_weights(CPU replica) → submit RDMA write
+      per bucket:  all-gather(GPU) -> load_weights(CPU replica) -> submit async RDMA write
       finish:      wait all RDMA writes
     """
 
@@ -240,8 +324,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         )
 
         self._registered = False
-        self._shared_buffer_mode = getattr(args, "rdma_shared_buffer", False)
-        num_workers = getattr(args, "rdma_transfer_workers", 4)
+        num_workers = getattr(args, "rdma_transfer_workers", 8)
         self.transfer_manager = RDMATransferManager(num_workers=num_workers)
 
     def connect_rollout_engines(
@@ -251,213 +334,41 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         self.rollout_engine_lock = rollout_engine_lock
 
         if self._is_source:
-            self.remote_weight_infos_by_session_id = {}
             targets = self.transfer_plan.plan_p2p()
-            targets_to_query = set((target.engine_ind, target.engine_rank) for target in targets)
-            targets_to_session_id, self.session_id_to_engine_rank = {}, {}
-            self.session_id_to_server_args = {}
-            for engine_ind, engine_rank in targets_to_query:
-                session_id, weights_info = ray.get(
-                    self.rollout_engines[engine_ind].get_remote_instance_transfer_engine_info.remote(rank=engine_rank)
-                )
-                parallelism_info = ray.get(
-                    self.rollout_engines[engine_ind].get_parallelism_info.remote(rank=engine_rank)
-                )
-
-                self.session_id_to_engine_rank[session_id] = engine_rank
-                self.session_id_to_server_args[session_id] = create_server_args_from_dict(
-                    ray.get(self.rollout_engines[engine_ind].get_server_info.remote())
-                )
-                assert session_id is not None, (
-                    f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
-                )
-                logger.info(
-                    f"[RDMA] Obtained remote {session_id} info from rollout engine {engine_ind} rank {engine_rank}"
-                )
-                logger.info(f"[RDMA] Remote weight info has {len(weights_info)} tensors.")
-                self.remote_weight_infos_by_session_id[session_id] = (weights_info, parallelism_info)
-                targets_to_session_id[(engine_ind, engine_rank)] = session_id
+            (
+                self.remote_weight_infos_by_session_id,
+                targets_to_session_id,
+                self.session_id_to_server_args,
+            ) = query_remote_weight_infos(rollout_engines, targets)
 
             print_memory("[RDMA] After obtaining remote weight info")
 
-            if self._shared_buffer_mode:
-                self._connect_shared_buffer_mode(targets, targets_to_session_id)
-            else:
-                self._connect_default_mode(targets, targets_to_session_id)
+            self.engines: dict[int, TransferBundle] = {}
+            for target in targets:
+                session_id = targets_to_session_id[(target.engine_ind, target.engine_rank)]
+                remote_info = RemoteWeightInfo(session_id, self.remote_weight_infos_by_session_id[session_id][0])
+                parallelism_config = RankParallelismConfig.from_dict(
+                    self.remote_weight_infos_by_session_id[session_id][1]
+                )
+                if target.engine_rank not in self.engines:
+                    transfer_engine = create_transfer_engine()
+                    logger.info(f"[RDMA] Creating CPU model replica for engine rank {target.engine_rank}")
+                    model_replica = create_cpu_replica(
+                        parallelism_config, self.args.hf_checkpoint, self.session_id_to_server_args[session_id]
+                    )
+                    param_mapper = ParameterMapper.from_model(model_replica)
+                    print_memory(f"[RDMA] After CPU model replica for engine rank {target.engine_rank}")
+                    bundle = TransferBundle(
+                        model_replica=model_replica,
+                        engine=transfer_engine,
+                        remote_weight_infos=[remote_info],
+                        param_mapper=param_mapper,
+                    )
+                    self.engines[target.engine_rank] = bundle
+                else:
+                    self.engines[target.engine_rank].add_remote_session(remote_info)
 
             print_memory("[RDMA] After all CPU replicas and engine creation")
-
-    def _connect_default_mode(self, targets, targets_to_session_id) -> None:
-        """Original per-replica connection mode."""
-        self.engines = {}
-        for target in targets:
-            session_id = targets_to_session_id[(target.engine_ind, target.engine_rank)]
-            remote_info = RemoteWeightInfo(session_id, self.remote_weight_infos_by_session_id[session_id][0])
-            parallelism_config = RankParallelismConfig.from_dict(
-                self.remote_weight_infos_by_session_id[session_id][1]
-            )
-            if target.engine_rank not in self.engines:
-                transfer_engine = self._create_transfer_engine()
-                logger.info(f"[RDMA] Creating CPU model replica for engine rank {target.engine_rank}")
-                model_replica = self._create_cpu_replica(
-                    parallelism_config, self.args.hf_checkpoint, self.session_id_to_server_args[session_id]
-                )
-                param_mapper = ParameterMapper.from_model(model_replica)
-                print_memory(f"[RDMA] After CPU model replica for engine rank {target.engine_rank}")
-                bundle = TransferBundle(
-                    model_replica=model_replica,
-                    engine=transfer_engine,
-                    remote_weight_infos=[remote_info],
-                    param_mapper=param_mapper,
-                )
-                self.engines[target.engine_rank] = bundle
-            else:
-                self.engines[target.engine_rank].add_remote_session(remote_info)
-
-    def _connect_shared_buffer_mode(self, targets, targets_to_session_id) -> None:
-        """Shared-buffer connection mode: one set of CPU pinned buffers for all engine ranks."""
-        # Collect distinct engine ranks and group targets
-        engine_rank_targets: dict[int, list] = {}
-        for target in targets:
-            engine_rank_targets.setdefault(target.engine_rank, []).append(target)
-
-        # Create ONE transfer engine
-        self._shared_engine = self._create_transfer_engine()
-        self._engine_rank_infos: dict[int, EngineRankInfo] = {}
-        self._shared_params_dict: dict[str, torch.Tensor] = {}
-        self._shared_param_mapper: ParameterMapper | None = None
-
-        first_engine_rank = True
-        for engine_rank, rank_targets in engine_rank_targets.items():
-            # Get parallelism config from first target of this engine rank
-            first_target = rank_targets[0]
-            session_id = targets_to_session_id[(first_target.engine_ind, first_target.engine_rank)]
-            parallelism_config = RankParallelismConfig.from_dict(
-                self.remote_weight_infos_by_session_id[session_id][1]
-            )
-            server_args = self.session_id_to_server_args[session_id]
-
-            if first_engine_rank:
-                # First engine rank: create full CPU pinned replica → shared buffers
-                logger.info(f"[RDMA] Creating shared CPU pinned replica from engine rank {engine_rank}")
-                model_replica = self._create_cpu_replica(
-                    parallelism_config, self.args.hf_checkpoint, server_args
-                )
-                self._shared_params_dict = dict(model_replica.named_parameters())
-                self._shared_param_mapper = ParameterMapper.from_model(model_replica)
-                print_memory(f"[RDMA] After shared CPU pinned replica for engine rank {engine_rank}")
-                first_engine_rank = False
-            else:
-                # Subsequent engine ranks: create lightweight replica sharing pinned buffers
-                logger.info(f"[RDMA] Creating lightweight replica for engine rank {engine_rank}")
-                model_replica = self._create_lightweight_replica(
-                    parallelism_config, self.args.hf_checkpoint, server_args
-                )
-                print_memory(f"[RDMA] After lightweight replica for engine rank {engine_rank}")
-
-            # Collect remote sessions for this engine rank
-            remote_infos = []
-            for target in rank_targets:
-                sid = targets_to_session_id[(target.engine_ind, target.engine_rank)]
-                remote_infos.append(RemoteWeightInfo(sid, self.remote_weight_infos_by_session_id[sid][0]))
-
-            self._engine_rank_infos[engine_rank] = EngineRankInfo(
-                engine_rank=engine_rank,
-                model_replica=model_replica,
-                remote_weight_infos=remote_infos,
-            )
-
-    def _create_transfer_engine(self) -> TransferEngine:
-        transfer_engine = TransferEngine()
-        local_ip = ray._private.services.get_node_ip_address()
-        transfer_engine.initialize(local_ip, "P2PHANDSHAKE", "rdma", "")
-        logger.info(f"[RDMA] Transfer Engine initialized at port {transfer_engine.get_rpc_port()}")
-        return transfer_engine
-
-    def _create_cpu_replica(
-        self,
-        parallelism_config: RankParallelismConfig,
-        model_path: str,
-        server_args: ServerArgs,
-    ) -> torch.nn.Module:
-        """Create model on GPU (required by sglang), then move to CPU pinned memory."""
-        load_config = LoadConfig(
-            load_format="auto",
-            model_loader_extra_config=server_args.model_loader_extra_config,
-            rl_quant_profile=server_args.rl_quant_profile,
-        )
-        server_args_module._global_server_args = server_args
-        with ParallelismContext(parallelism_config):
-            model = get_model(
-                model_config=ModelConfig(model_path),
-                load_config=load_config,
-                device_config=DeviceConfig(),
-            )
-
-        gpu_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"[RDMA] GPU model created: {gpu_params} params")
-
-        # Move all parameters to CPU pinned memory
-        with timer("rdma_move_replica_to_cpu"):
-            for param in model.parameters():
-                cpu_data = param.data.to("cpu", non_blocking=True).pin_memory()
-                param.data = cpu_data
-            torch.cuda.synchronize()
-
-        torch.cuda.empty_cache()
-
-        total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-        logger.info(
-            f"[RDMA] CPU pinned replica: {gpu_params} params, "
-            f"{total_bytes / (1024**3):.2f} GB"
-        )
-        print_memory("[RDMA] After moving replica to CPU and freeing GPU")
-        return model
-
-    def _create_lightweight_replica(
-        self,
-        parallelism_config: RankParallelismConfig,
-        model_path: str,
-        server_args: ServerArgs,
-    ) -> torch.nn.Module:
-        """Create model on GPU (different weight_loaders), then point params to shared CPU pinned buffers.
-
-        The model object (layers, weight_loaders) stays alive but shares the underlying
-        storage with the first replica's CPU pinned buffers. No new CPU allocation.
-        Only used in shared-buffer mode.
-        """
-        load_config = LoadConfig(
-            load_format="auto",
-            model_loader_extra_config=server_args.model_loader_extra_config,
-            rl_quant_profile=server_args.rl_quant_profile,
-        )
-        server_args_module._global_server_args = server_args
-        with ParallelismContext(parallelism_config):
-            model = get_model(
-                model_config=ModelConfig(model_path),
-                load_config=load_config,
-                device_config=DeviceConfig(),
-            )
-
-        gpu_params = sum(p.numel() for p in model.parameters())
-        logger.info(f"[RDMA] Lightweight replica GPU model created: {gpu_params} params")
-
-        # Point all params to shared pinned buffers (no new CPU allocation)
-        for name, param in model.named_parameters():
-            if name not in self._shared_params_dict:
-                logger.warning(
-                    f"[RDMA] Parameter {name} not found in shared buffers, skipping"
-                )
-                continue
-            param.data = self._shared_params_dict[name]
-
-        torch.cuda.empty_cache()
-        logger.info(
-            f"[RDMA] Lightweight replica: {gpu_params} params, "
-            f"sharing {len(self._shared_params_dict)} CPU pinned buffers"
-        )
-        print_memory("[RDMA] After lightweight replica (shared buffers, GPU freed)")
-        return model
 
     def leader_post_update(self) -> None:
         ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
@@ -475,154 +386,38 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
 
         if not self._registered:
             with timer("rdma_cpu_registration"):
-                if self._shared_buffer_mode:
-                    # Shared-buffer mode: register shared buffers once with the shared engine
-                    self._shared_weight_memory_registry = register_cpu_memory_region(
-                        self._shared_params_dict, self._shared_engine
+                for bundle in self.engines.values():
+                    bundle.weight_memory_registry = register_cpu_memory_region(
+                        bundle.params_dict, bundle.engine
                     )
-                else:
-                    for bundle in self.engines.values():
-                        bundle.weight_memory_registry = register_cpu_memory_region(
-                            bundle.params_dict, bundle.engine
-                        )
             self._registered = True
 
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """Load weights directly into CPU replica, submit RDMA writes.
-
-        load_weights() calls .copy_() on CPU pinned params with GPU source tensors,
-        which implicitly performs GPU→CPU transfer. No separate D2H step needed.
-        After load_weights, submit async RDMA writes from CPU to remote GPUs.
-        """
+        """Load weights directly into CPU replica, submit async RDMA writes."""
         if not self._is_source or not converted_named_tensors:
             return
 
-        if self._shared_buffer_mode:
-            self._update_bucket_shared_buffer(converted_named_tensors)
-        else:
-            self._update_bucket_default(converted_named_tensors)
-
-    def _update_bucket_default(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
-        """Default per-replica transfer path."""
         for transfer_bundle in self.engines.values():
             with timer("get_transfer_ready_params", log_info=False):
                 transfer_ready_params = transfer_bundle.get_transfer_ready_params(converted_named_tensors)
             with timer("load_weights_to_cpu_replica", log_info=False):
                 transfer_bundle.model_replica.load_weights(converted_named_tensors)
-            with timer("rdma_submit", log_info=False):
-                self.transfer_manager.submit_for_transfer(transfer_bundle, transfer_ready_params)
-
-        converted_named_tensors.clear()
-
-    def _update_bucket_shared_buffer(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
-        """Shared-buffer transfer path: serialize across engine ranks."""
-        for info in self._engine_rank_infos.values():
-            # 1. load_weights() writes correct shard into shared CPU pinned buffers
-            #    (this model_replica's weight_loaders slice the correct shard for this engine rank)
-            with timer("load_weights_to_shared_buffer", log_info=False):
-                info.model_replica.load_weights(converted_named_tensors)
-
-            # 2. Track which params are ready for transfer (reset shard tracking per engine rank)
-            with timer("get_transfer_ready_params_shared", log_info=False):
-                transfer_ready_params = self._get_shared_transfer_ready_params(converted_named_tensors)
-
-            # 3. Synchronous RDMA write from shared CPU buffers to remote GPUs
             if transfer_ready_params:
-                with timer("rdma_sync_write_shared", log_info=False):
-                    self._do_shared_rdma_write(info, transfer_ready_params)
+                with timer("rdma_submit", log_info=False):
+                    self.transfer_manager.submit(transfer_bundle.do_rdma_write, transfer_ready_params)
 
-        # Clear AFTER all engine ranks are processed
         converted_named_tensors.clear()
-
-    def _get_shared_transfer_ready_params(
-        self, converted_named_tensors: list[tuple[str, torch.Tensor]]
-    ) -> list[str]:
-        """Track which parameters are ready using the shared ParameterMapper.
-
-        Uses fresh state per call (no cross-engine-rank accumulation).
-        """
-        transfer_ready_params = []
-        update_pending: dict[str, int] = {}
-        params_dict = self._shared_params_dict
-
-        for name, _ in converted_named_tensors:
-            mapped_result = self._shared_param_mapper.map(name)
-            mapped, num_shards, num_experts = (
-                mapped_result.sglang_name,
-                mapped_result.num_shards,
-                mapped_result.num_local_experts,
-            )
-            if mapped not in params_dict:
-                logger.warning(f"Parameter {mapped} not found in shared model replica.")
-                continue
-
-            if num_experts is not None and num_experts > 0:
-                total_expected = num_experts * num_shards
-            else:
-                total_expected = num_shards
-
-            if total_expected == 1:
-                transfer_ready_params.append(mapped)
-            else:
-                if mapped not in update_pending:
-                    update_pending[mapped] = total_expected - 1
-                else:
-                    update_pending[mapped] -= 1
-                if update_pending[mapped] == 0:
-                    transfer_ready_params.append(mapped)
-
-        return transfer_ready_params
-
-    def _do_shared_rdma_write(self, info: EngineRankInfo, names: list[str]) -> None:
-        """Synchronous RDMA write from shared CPU pinned buffers to remote GPUs."""
-        source_ptrs, source_lens = [], []
-        valid_names = []
-
-        for name in names:
-            cpu_reg = self._shared_weight_memory_registry.get(name)
-            if cpu_reg is None:
-                logger.warning(f"[RDMA] Parameter {name} not in shared weight registry")
-                continue
-
-            data_ptr, numel, ele_size = cpu_reg
-            source_ptrs.append(data_ptr)
-            source_lens.append(numel * ele_size)
-            valid_names.append(name)
-
-        if not source_ptrs:
-            return
-
-        for remote_session in info.remote_weight_infos:
-            session_id = remote_session.session_id
-            remote_weights_info = remote_session.weights_info
-
-            target_ptrs = []
-            for name in valid_names:
-                if name in remote_weights_info:
-                    target_ptrs.append(remote_weights_info[name][0])
-
-            if len(target_ptrs) != len(source_ptrs):
-                logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
-                continue
-
-            ret = self._shared_engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-            if ret < 0:
-                logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
     def finish_transfer_task(self) -> None:
-        """Wait for all RDMA writes to complete."""
+        """Wait for all async RDMA writes to complete."""
         if not self._is_source:
             return
 
-        if self._shared_buffer_mode:
-            # Shared-buffer mode: all writes are synchronous, nothing to wait for
-            logger.info("[RDMA] Shared-buffer mode: all transfers already complete (synchronous)")
-        else:
-            logger.info("[RDMA] Waiting for RDMA transfers to complete...")
-            self.transfer_manager.wait_transfers()
-            logger.info("[RDMA] All transfers complete")
+        logger.info("[RDMA] Waiting for RDMA transfers to complete...")
+        self.transfer_manager.wait_transfers()
+        logger.info("[RDMA] All transfers complete")
 
-            for transfer_bundle in self.engines.values():
-                transfer_bundle.reset()
+        for transfer_bundle in self.engines.values():
+            transfer_bundle.reset()
