@@ -17,7 +17,7 @@ import os
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    mode: Literal["nccl", "rdma", "rdma-shared", "both", "all"] = "all"
+    mode: Literal["nccl", "rdma", "rdma-shared", "all"] = "all"
     # Right now tp=ep=pp=1
     train_tp: int = 4
     train_ep: int = 16
@@ -45,6 +45,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     bucket_size: float = 1.0
     released_mc_transfer_timeout: bool = False
     no_save_optim: bool = False
+    skip_validation: bool = False
 
     def validate(self):
         if self.multinode:
@@ -55,9 +56,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
             ), "num_train_gpus + num_rollout_gpus must equal to nnodes * GPUS_PER_NODE"
 
     def selected_modes(self) -> list[str]:
-        if self.mode == "both":
-            return ["nccl", "rdma"]
-        elif self.mode == "all":
+        if self.mode == "all":
             return ["nccl", "rdma", "rdma-shared"]
         else:
             return [self.mode]
@@ -211,6 +210,8 @@ def execute(args: ScriptArgs, mode: str):
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    if args.skip_validation:
+        sglang_args += "--sglang-load-format dummy "
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = (
@@ -234,8 +235,9 @@ def execute(args: ScriptArgs, mode: str):
         # 4GB buffer for weight update
         f"--update-weight-buffer-size {mem} "
         # enable correctness check
-        f"--check-weight-update-equal "
     )
+    if not args.skip_validation:
+        misc_args += "--check-weight-update-equal "
     if is_rdma:
         misc_args += "--update-weight-transfer-mode rdma "
     if mode == "rdma-shared":

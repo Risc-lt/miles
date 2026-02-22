@@ -8,7 +8,7 @@ Runs 13 steps; average the last 10 for stable profiling numbers.
 Usage:
     python test_weight_transfer_moe_multinode.py \
         --multinode --head-node-ip <IP> --node-rank <RANK> --nnodes 4 \
-        [--mode nccl|rdma|rdma-shared|both|all] \
+        [--mode nccl|rdma|rdma-shared|all] \
         [--models llama3,glm4,moonlight,qwen3-30b,qwen3-32b]
 """
 
@@ -94,8 +94,9 @@ ALL_MODEL_KEYS = list(MODELS.keys())
 # ---------------------------------------------------------------------------
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    mode: Literal["nccl", "rdma", "rdma-shared", "both", "all"] = "all"
+    mode: Literal["nccl", "rdma", "rdma-shared", "all"] = "all"
     models: str = ",".join(ALL_MODEL_KEYS)  # comma-separated model keys
+    skip_validation: bool = False
     # Multi-node settings
     multinode: bool = True
     head_node_ip: str | None = None
@@ -127,9 +128,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
         return out
 
     def selected_modes(self) -> list[str]:
-        if self.mode == "both":
-            return ["nccl", "rdma"]
-        elif self.mode == "all":
+        if self.mode == "all":
             return ["nccl", "rdma", "rdma-shared"]
         else:
             return [self.mode]
@@ -251,6 +250,8 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
         sglang_args += "--sglang-enable-dp-attention --sglang-enable-dp-lm-head "
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    if args.skip_validation:
+        sglang_args += "--sglang-load-format dummy "
 
     # --- Misc ---
     mem = (
@@ -265,8 +266,9 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
         f"--actor-num-nodes {args.num_train_gpus // GPUS_PER_NODE} "
         f"--actor-num-gpus-per-node {GPUS_PER_NODE} "
         f"--update-weight-buffer-size {mem} "
-        "--check-weight-update-equal "
     )
+    if not args.skip_validation:
+        misc_args += "--check-weight-update-equal "
     if is_rdma:
         misc_args += "--update-weight-transfer-mode rdma "
     if mode == "rdma-shared":

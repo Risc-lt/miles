@@ -1,6 +1,6 @@
 EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP=cpu-direct-235B
-JOBID=5272988
+JOBID=5276069
 
 srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     pid=\$(enroot list -f | grep 'pyxis_${JOBID}' -A 1 | awk '\$2 ~ /^[0-9]+\$/ {print \$2; exit}')
@@ -16,6 +16,10 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     LOG_DIR='/data/logs/qwen235b/${EXEC_DATE}-${EXP}'
     mkdir -p \\\$LOG_DIR
     export MILES_LOG_DIR=\\\$LOG_DIR
+    
+    cd /sgl-workspace/sglang && \
+    git fetch jd --quiet && \
+    git reset --hard jd/remote-instance-loader-slime-integration
 
     cd /root/miles
     git fetch lt --quiet && git reset --hard lt/jd/rdma-sharable-cpu-replica

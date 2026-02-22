@@ -30,6 +30,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     pipelined_transfer: bool = False
     # Profiling
     use_pytorch_profiler_update_weight: bool = False
+    skip_validation: bool = False
 
     def validate(self):
         assert self.sglang_pp == 1, "Not supported yet for sglang pp"
@@ -132,6 +133,8 @@ def execute(args: ScriptArgs):
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    if args.skip_validation:
+        sglang_args += "--sglang-load-format dummy "
     # ci_args = "--ci-test "
 
     misc_args = (
@@ -148,8 +151,9 @@ def execute(args: ScriptArgs):
         # 1GB buffer for weight update
         f"--update-weight-buffer-size {1 * 1024 ** 3} "
         # enable correctness check
-        f"--check-weight-update-equal "
     )
+    if not args.skip_validation:
+        misc_args += "--check-weight-update-equal "
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
 

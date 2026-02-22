@@ -18,6 +18,10 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     export MILES_LOG_DIR=\\\$LOG_DIR
     export HF_TOKEN=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 
 
+    cd /sgl-workspace/sglang && \
+    git fetch jd --quiet && \
+    git reset --hard jd/remote-instance-loader-slime-integration
+    
     cd /root/miles
     git fetch lt --quiet && git reset --hard lt/jd/rdma-sharable-cpu-replica
 
