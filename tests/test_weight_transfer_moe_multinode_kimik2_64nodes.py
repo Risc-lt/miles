@@ -197,7 +197,9 @@ def execute(args: ScriptArgs):
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
         "--sglang-enable-dp-lm-head "
-        "--sglang-cuda-graph-bs 1 2 4 8 "
+        "--sglang-disable-cuda-graph "
+        # "--sglang-cuda-graph-bs 1 2 4 8 "
+
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 8 "
