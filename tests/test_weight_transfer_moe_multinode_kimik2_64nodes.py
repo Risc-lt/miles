@@ -27,7 +27,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
     sglang_tp: int = 16  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
     sglang_dp: int = 1
-    sglang_ep: int = 32
+    sglang_ep: int = 16
     sglang_pp: int = 1
     # Total Resources: 64 nodes = 512 GPUs, split 50/50
     num_train_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
@@ -137,7 +137,7 @@ def execute(args: ScriptArgs):
         "--num-rollout 4 "
         "--rollout-batch-size 8 "
         "--n-samples-per-prompt 8 "
-        "--rollout-max-response-len 100 "
+        "--rollout-max-response-len 10 "
         "--rollout-temperature 0.8 "
         "--global-batch-size 64 "
         "--balance-data "
@@ -192,7 +192,7 @@ def execute(args: ScriptArgs):
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        "--sglang-mem-fraction-static 0.8 "
+        "--sglang-mem-fraction-static 0.9 "
         # "--sglang-enable-dp-attention "
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
@@ -200,7 +200,7 @@ def execute(args: ScriptArgs):
         "--sglang-cuda-graph-bs 1 2 4 8 "
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
-        "--sglang-server-concurrency 128 "
+        "--sglang-server-concurrency 8"
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
