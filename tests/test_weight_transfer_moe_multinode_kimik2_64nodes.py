@@ -25,9 +25,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     train_cp: int = 4
     train_etp: int = 1
     # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
-    sglang_tp: int = 16  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
+    sglang_tp: int = 32  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
     sglang_dp: int = 1
-    sglang_ep: int = 16
+    sglang_ep: int = 32
     sglang_pp: int = 1
     # Total Resources: 64 nodes = 512 GPUs, split 50/50
     num_train_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
