@@ -50,10 +50,8 @@ def convert_glm4_to_hf(args, name, param):
                 (f"model.layers.{layer_idx}.self_attn.v_proj.bias", v_bias),
             ]
         elif rest == "mlp.linear_fc1.weight":
-            gate_proj, up_proj = param.chunk(2, dim=0)
             return [
-                (f"model.layers.{layer_idx}.mlp.gate_proj.weight", gate_proj),
-                (f"model.layers.{layer_idx}.mlp.up_proj.weight", up_proj),
+                (f"model.layers.{layer_idx}.mlp.gate_up_proj.weight", param),
             ]
         elif rest == "mlp.linear_fc2.weight":
             return [(f"model.layers.{layer_idx}.mlp.down_proj.weight", param)]
