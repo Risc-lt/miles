@@ -77,6 +77,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         )
 
         self._registered = False
+        self._update_pending: dict[str, int] = {}
         num_workers = getattr(args, "rdma_transfer_workers", 4)
         self.transfer_manager = RDMATransferManager(num_workers=num_workers)
 
@@ -269,13 +270,16 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
     def _get_transfer_ready_params(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]]
     ) -> list[str]:
-        """Determine which sglang params have all shards present in this bucket.
+        """Determine which sglang params have all shards present so far.
 
         Uses the shared ParameterMapper — the result is engine-rank-independent
         since the mapping is a property of model architecture, not parallelism layout.
+
+        Uses self._update_pending (persistent across bucket calls) to correctly
+        track multi-shard parameters whose shards span multiple buckets (e.g.,
+        MoE expert weights with EP > 1).
         """
         transfer_ready_params = []
-        update_pending: dict[str, int] = {}
         params_dict = self._shared_params_dict
 
         for name, _ in converted_named_tensors:
@@ -297,11 +301,11 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
             if total_expected == 1:
                 transfer_ready_params.append(mapped)
             else:
-                if mapped not in update_pending:
-                    update_pending[mapped] = total_expected - 1
+                if mapped not in self._update_pending:
+                    self._update_pending[mapped] = total_expected - 1
                 else:
-                    update_pending[mapped] -= 1
-                if update_pending[mapped] == 0:
+                    self._update_pending[mapped] -= 1
+                if self._update_pending[mapped] == 0:
                     transfer_ready_params.append(mapped)
 
         return transfer_ready_params
@@ -351,4 +355,5 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         if not self._is_source:
             return
         self.transfer_manager.wait_transfers()
+        self._update_pending = {}
         logger.info("[RDMA-Shared] All transfers complete")
