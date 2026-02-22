@@ -90,8 +90,12 @@ def prepare(args: ScriptArgs):
         )
 
 
-def execute(args: ScriptArgs, mode: str):
+def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     is_rdma = mode in ("rdma", "rdma-shared")
+
+    run_log_dir = f"{base_log_dir}/kimik2-profile/{mode}"
+    os.makedirs(run_log_dir, exist_ok=True)
+    os.environ["MILES_LOG_DIR"] = run_log_dir
 
     # Log experiment configuration at the start
 
@@ -277,7 +281,7 @@ def execute(args: ScriptArgs, mode: str):
             "NCCL_NVLS_ENABLE": (
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
-            **({"MILES_LOG_DIR": os.environ["MILES_LOG_DIR"]} if "MILES_LOG_DIR" in os.environ else {}),
+            "MILES_LOG_DIR": run_log_dir,
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,
@@ -294,11 +298,12 @@ def execute(args: ScriptArgs, mode: str):
 def main(args: ScriptArgs):
     args.validate()
     prepare(args)
+    base_log_dir = os.environ.get("MILES_LOG_DIR", "/root")
     for mode in args.selected_modes():
         print(f"\n{'='*60}")
         print(f"  Running: {MODEL_NAME} / {mode}")
         print(f"{'='*60}\n")
-        execute(args, mode)
+        execute(args, mode, base_log_dir)
 
 
 if __name__ == "__main__":

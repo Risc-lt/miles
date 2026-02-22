@@ -35,12 +35,17 @@ srun --jobid=${JOBID} --nodes=64 --ntasks-per-node=1 --overlap bash -c "
 
     if [ \\\$NODE_RANK -eq 0 ]; then
         [ -d /root/rdma_profiler_logs ] && cp -r /root/rdma_profiler_logs \\\$LOG_DIR/
-        if [ -f \\\$LOG_DIR/miles_timer_0.log ]; then
-        python /root/miles/consolidate_timer_log.py \\\$LOG_DIR/miles_timer_0.log
-        echo 'Timer log consolidated'
-        fi
-        echo 'Profiler extraction complete'
-        ls -la \\\$LOG_DIR/
+        # Consolidate all timer logs (nested under kimik2-profile/<mode>/)
+        find \\\$LOG_DIR -name 'miles_timer_0.log' | while read logfile; do
+            echo \\\"Consolidating: \\\$logfile\\\"
+            python /root/miles/consolidate_timer_log.py \\\"\\\$logfile\\\" || true
+        done
+
+        echo ''
+        echo '=== Results directory structure ==='
+        find \\\$LOG_DIR/kimik2-profile -type f -name '*.log' | sort
+        echo ''
+        echo 'Profiling complete'
     fi
     \"
 "

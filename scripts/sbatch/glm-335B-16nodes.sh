@@ -38,14 +38,17 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
         # Copy profiler traces to log dir
         [ -d /root/rdma_profiler_logs ] && cp -r /root/rdma_profiler_logs \\\$LOG_DIR/
 
-        # Consolidate timer log
-        if [ -f \\\$LOG_DIR/miles_timer_0.log ]; then
-        python /root/miles/consolidate_timer_log.py \\\$LOG_DIR/miles_timer_0.log
-        echo 'Timer log consolidated'
-        fi
+        # Consolidate all timer logs (nested under glm355b-profile/<mode>/)
+        find \\\$LOG_DIR -name 'miles_timer_0.log' | while read logfile; do
+            echo \\\"Consolidating: \\\$logfile\\\"
+            python /root/miles/consolidate_timer_log.py \\\"\\\$logfile\\\" || true
+        done
 
-        echo 'Profiler extraction complete'
-        ls -la \\\$LOG_DIR/
+        echo ''
+        echo '=== Results directory structure ==='
+        find \\\$LOG_DIR/glm355b-profile -type f -name '*.log' | sort
+        echo ''
+        echo 'Profiling complete'
     fi
     \"
 "

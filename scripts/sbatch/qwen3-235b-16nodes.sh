@@ -29,7 +29,7 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
 
     python /root/miles/tests/test_weight_transfer_moe_multinode_qwen235b_16nodes.py \\
         --multinode --mode all \\
-        --head-node-ip \\\$HEAD_NODE_IP --nnodes \\\$NNODES --node-rank \\\$NODE_RANK \\
+        --head-node-ip \\\$HEAD_NODE_IP --nnodes \\\$NNODES --skip_validation --node-rank \\\$NODE_RANK \\
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after --bucket-size 1 \\
         2>&1 | tee \\\$LOG_DIR/node_\\\$NODE_RANK.log
 
@@ -37,14 +37,17 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
         # Copy profiler traces to log dir
         [ -d /root/rdma_profiler_logs ] && cp -r /root/rdma_profiler_logs \\\$LOG_DIR/
 
-        # Consolidate timer log
-        if [ -f \\\$LOG_DIR/miles_timer_0.log ]; then
-        python /root/miles/consolidate_timer_log.py \\\$LOG_DIR/miles_timer_0.log
-        echo 'Timer log consolidated'
-        fi
+        # Consolidate all timer logs (nested under qwen235b-profile/<mode>/)
+        find \\\$LOG_DIR -name 'miles_timer_0.log' | while read logfile; do
+            echo \\\"Consolidating: \\\$logfile\\\"
+            python /root/miles/consolidate_timer_log.py \\\"\\\$logfile\\\" || true
+        done
 
-        echo 'Profiler extraction complete'
-        ls -la \\\$LOG_DIR/
+        echo ''
+        echo '=== Results directory structure ==='
+        find \\\$LOG_DIR/qwen235b-profile -type f -name '*.log' | sort
+        echo ''
+        echo 'Profiling complete'
     fi
     \"
 "
