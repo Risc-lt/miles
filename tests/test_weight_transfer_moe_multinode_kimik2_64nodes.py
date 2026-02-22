@@ -192,12 +192,12 @@ def execute(args: ScriptArgs):
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        "--sglang-mem-fraction-static 0.75 "
+        "--sglang-mem-fraction-static 0.6 "
         "--sglang-enable-dp-attention "
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
         "--sglang-enable-dp-lm-head "
-        "--sglang-cuda-graph-bs 1 2 4 8 16 "
+        "--sglang-cuda-graph-bs 1 2 4 8 "
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 1024 "
