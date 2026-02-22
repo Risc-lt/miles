@@ -15,7 +15,7 @@ import os
 
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
-    mode: Literal["nccl", "rdma"] = "nccl"
+    mode: Literal["nccl", "rdma", "rdma-shared", "both", "all"] = "all"
     # Training parallelism (matches run_glm45_355b_a32b.py for 8 train nodes)
     train_tp: int = 4
     train_ep: int = 8
@@ -54,6 +54,14 @@ class ScriptArgs(U.ExecuteTrainConfig):
                 self.num_train_gpus + self.num_rollout_gpus == self.nnodes * GPUS_PER_NODE
             ), "num_train_gpus + num_rollout_gpus must equal to nnodes * GPUS_PER_NODE"
 
+    def selected_modes(self) -> list[str]:
+        if self.mode == "both":
+            return ["nccl", "rdma"]
+        elif self.mode == "all":
+            return ["nccl", "rdma", "rdma-shared"]
+        else:
+            return [self.mode]
+
 
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
@@ -81,12 +89,14 @@ def prepare(args: ScriptArgs):
         )
 
 
-def execute(args: ScriptArgs):
+def execute(args: ScriptArgs, mode: str):
+    is_rdma = mode in ("rdma", "rdma-shared")
+
     # Log experiment configuration at the start
 
     log_experiment_start(
         {
-            "mode": args.mode,
+            "mode": mode,
             "num_train_gpus": args.num_train_gpus,
             "num_rollout_gpus": args.num_rollout_gpus,
             "train_tp": args.train_tp,
@@ -195,13 +205,13 @@ def execute(args: ScriptArgs):
         # GLM-4.5-specific: dense TP size
         "--sglang-moe-dense-tp-size 1 "
     )
-    if args.mode == "rdma":
+    if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = (
         int(args.bucket_size * 1024 * 1024 * 1024)
-        if args.mode == "rdma"
+        if is_rdma
         else (4 * 1024 * 1024 * 1024)
     )
 
@@ -220,10 +230,10 @@ def execute(args: ScriptArgs):
         # enable correctness check
         f"--check-weight-update-equal "
     )
-    if args.mode == "rdma":
+    if is_rdma:
         misc_args += "--update-weight-transfer-mode rdma "
-        if args.rdma_shared_buffer:
-            misc_args += "--rdma-shared-buffer "
+    if mode == "rdma-shared":
+        misc_args += "--rdma-shared-buffer "
 
     train_args = (
         f"{ckpt_args} "
@@ -261,7 +271,7 @@ def execute(args: ScriptArgs):
         num_gpus=num_gpus,
     )
     if args.node_rank > 0 and args.wait_after:
-        if args.mode == "nccl":
+        if mode == "nccl":
             time.sleep(800)
         else:
             time.sleep(3600)
@@ -271,7 +281,11 @@ def execute(args: ScriptArgs):
 def main(args: ScriptArgs):
     args.validate()
     prepare(args)
-    execute(args)
+    for mode in args.selected_modes():
+        print(f"\n{'='*60}")
+        print(f"  Running: {MODEL_NAME} / {mode}")
+        print(f"{'='*60}\n")
+        execute(args, mode)
 
 
 if __name__ == "__main__":

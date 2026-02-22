@@ -161,11 +161,10 @@ def prepare(args: ScriptArgs, cfg: ModelConfig):
 # ---------------------------------------------------------------------------
 # Execute one (model, mode) pair
 # ---------------------------------------------------------------------------
-def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
+def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is_last_mode: bool = True):
     is_rdma = mode in ("rdma", "rdma-shared")
 
-    log_dir = os.environ.get("MILES_LOG_DIR", "/root")
-    run_log_dir = f"{log_dir}/4node-profile/{cfg.key}/{mode}"
+    run_log_dir = f"{base_log_dir}/4node-profile/{cfg.key}/{mode}"
     os.makedirs(run_log_dir, exist_ok=True)
     os.environ["MILES_LOG_DIR"] = run_log_dir
 
@@ -312,7 +311,30 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str):
     )
 
     if args.node_rank > 0 and args.wait_after:
-        time.sleep(800 if mode == "nccl" else 3600)  # rdma/rdma-shared need more time
+        if is_last_mode:
+            # Only sleep on the very last mode; intermediate modes are
+            # synchronised by the head-node's blocking `ray job submit`.
+            time.sleep(800 if mode == "nccl" else 3600)
+        else:
+            # For intermediate modes, wait for the head node's ray job to
+            # finish by polling until the Ray GCS is unreachable (head node
+            # did `ray stop`).  Then stop the local Ray daemon so we can
+            # rejoin a fresh cluster for the next mode.
+            import ray
+            while True:
+                try:
+                    ray.init(address="auto", ignore_reinit_error=True)
+                    available = ray.available_resources().get("GPU", 0)
+                    ray.shutdown()
+                    # If the head-node has torn down the cluster the init
+                    # call above will raise.  While it still succeeds the
+                    # job is still running (or the head hasn't killed Ray
+                    # yet) – keep waiting.
+                    time.sleep(5)
+                except Exception:
+                    break
+            # Stop local Ray so we can rejoin the next cluster
+            U.exec_command("ray stop --force; pkill -9 ray; true")
 
 
 # ---------------------------------------------------------------------------
@@ -324,13 +346,16 @@ def main(args: ScriptArgs):
     modes = args.selected_modes()
     model_cfgs = args.selected_models()
 
+    # Save original log dir before the loop to prevent nesting
+    base_log_dir = os.environ.get("MILES_LOG_DIR", "/root")
+
     for cfg in model_cfgs:
         prepare(args, cfg)
         for mode in modes:
             print(f"\n{'='*60}")
             print(f"  Running: {cfg.key} / {mode}")
             print(f"{'='*60}\n")
-            execute(args, cfg, mode)
+            execute(args, cfg, mode, base_log_dir)
 
 
 if __name__ == "__main__":

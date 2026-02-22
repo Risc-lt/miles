@@ -19,13 +19,13 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     export HF_TOKEN=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 
 
     cd /root/miles
-    git fetch lt --quiet && git reset --hard lt/jd/rdma-cpu-replica-direct
+    git fetch lt --quiet && git reset --hard lt/jd/rdma-sharable-cpu-replica
 
     # Clean stale profiler traces before run
     rm -rf /root/rdma_profiler_logs
 
     python /root/miles/tests/test_weight_transfer_moe_multinode_glm45_355b_16nodes.py \\
-        --multinode --mode rdma --pipelined-transfer \\
+        --multinode --mode all \\
         --head-node-ip \\\$HEAD_NODE_IP --nnodes \\\$NNODES --node-rank \\\$NODE_RANK \\
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after --bucket-size 1 \\
         2>&1 | tee \\\$LOG_DIR/node_\\\$NODE_RANK.log
