@@ -200,7 +200,7 @@ def execute(args: ScriptArgs):
         "--sglang-cuda-graph-bs 1 2 4 8 "
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
-        "--sglang-server-concurrency 8"
+        "--sglang-server-concurrency 8 "
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
