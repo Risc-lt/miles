@@ -349,13 +349,14 @@ def main(args: ScriptArgs):
     # Save original log dir before the loop to prevent nesting
     base_log_dir = os.environ.get("MILES_LOG_DIR", "/root")
 
-    for cfg in model_cfgs:
+    for ci, cfg in enumerate(model_cfgs):
         prepare(args, cfg)
-        for mode in modes:
+        for mi, mode in enumerate(modes):
+            is_last = (ci == len(model_cfgs) - 1) and (mi == len(modes) - 1)
             print(f"\n{'='*60}")
             print(f"  Running: {cfg.key} / {mode}")
             print(f"{'='*60}\n")
-            execute(args, cfg, mode, base_log_dir)
+            execute(args, cfg, mode, base_log_dir, is_last_mode=is_last)
 
 
 if __name__ == "__main__":
