@@ -258,16 +258,26 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
                 is_last = i == last_idx
                 if is_last:
-                    # Last engine rank: submit to background thread.
+                    # Last engine rank: fire-and-forget all sessions to background
                     with timer("rdma_async_write", log_info=False):
-                        self.transfer_manager.submit(
-                            self._do_rdma_write, info, transfer_ready_params
-                        )
+                        for remote_session in info.remote_weight_infos:
+                            self.transfer_manager.submit(
+                                self._do_rdma_write_one_session,
+                                info, remote_session, transfer_ready_params,
+                            )
                 else:
-                    # Not the last rank: synchronous write.
-                    # Must complete before the next load_weights() overwrites the buffer.
+                    # Non-last rank: fan out sessions in parallel, then wait
+                    # (must complete before next load_weights overwrites buffer)
                     with timer("rdma_sync_write", log_info=False):
-                        self._do_rdma_write(info, transfer_ready_params)
+                        futures = [
+                            self.transfer_manager.submit_returning_future(
+                                self._do_rdma_write_one_session,
+                                info, remote_session, transfer_ready_params,
+                            )
+                            for remote_session in info.remote_weight_infos
+                        ]
+                        for f in futures:
+                            f.result()
 
         # Clear the input list (caller convention)
         converted_named_tensors.clear()
@@ -327,11 +337,13 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         return transfer_ready_params, ready_hf_tensors
 
-    def _do_rdma_write(self, info: EngineRankInfo, names: list[str]) -> None:
-        """RDMA write from shared CPU pinned buffers to remote GPUs.
+    def _do_rdma_write_one_session(
+        self, info: EngineRankInfo, remote_session: RemoteWeightInfo, names: list[str]
+    ) -> None:
+        """RDMA write from shared CPU pinned buffers to a single remote session.
 
-        Called synchronously for all engine ranks except the last,
-        and in a background thread for the last engine rank.
+        Used by the parallelized submission path where each session within an
+        engine rank is submitted as a separate task to RDMATransferManager.
         """
         source_ptrs, source_lens = [], []
         valid_names = []
@@ -339,7 +351,6 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         for name in names:
             cpu_reg = self._weight_memory_registry.get(name)
             if cpu_reg is None:
-                logger.warning(f"[RDMA-Shared] Parameter {name} not in shared weight registry")
                 continue
 
             data_ptr, numel, ele_size = cpu_reg
@@ -350,22 +361,19 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         if not source_ptrs:
             return
 
-        for remote_session in info.remote_weight_infos:
-            session_id = remote_session.session_id
-            remote_weights_info = remote_session.weights_info
+        session_id = remote_session.session_id
+        target_ptrs = []
+        for name in valid_names:
+            if name in remote_session.weights_info:
+                target_ptrs.append(remote_session.weights_info[name][0])
 
-            target_ptrs = []
-            for name in valid_names:
-                if name in remote_weights_info:
-                    target_ptrs.append(remote_weights_info[name][0])
+        if len(target_ptrs) != len(source_ptrs):
+            logger.warning(f"[RDMA-Shared] Pointer count mismatch for session {session_id}")
+            return
 
-            if len(target_ptrs) != len(source_ptrs):
-                logger.warning(f"[RDMA-Shared] Pointer count mismatch for session {session_id}")
-                continue
-
-            ret = self._engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-            if ret < 0:
-                logger.error(f"[RDMA-Shared] Transfer failed for session {session_id}, error: {ret}")
+        ret = self._engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
+        if ret < 0:
+            logger.error(f"[RDMA-Shared] Transfer failed for session {session_id}, error: {ret}")
 
     def finish_transfer_task(self) -> None:
         """Wait for all background RDMA writes to complete."""

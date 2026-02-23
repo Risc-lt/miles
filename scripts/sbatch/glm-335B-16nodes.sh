@@ -1,6 +1,6 @@
 EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP=cpu-direct-glm355b
-JOBID=5272988
+JOBID=5276069
 
 srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     pid=\$(enroot list -f | grep 'pyxis_${JOBID}' -A 1 | awk '\$2 ~ /^[0-9]+\$/ {print \$2; exit}')
@@ -29,7 +29,7 @@ srun --jobid=${JOBID} --nodes=16 --ntasks-per-node=1 --overlap bash -c "
     rm -rf /root/rdma_profiler_logs
 
     python /root/miles/tests/test_weight_transfer_moe_multinode_glm45_355b_16nodes.py \\
-        --multinode --mode all \\
+        --multinode --mode nccl \\
         --head-node-ip \\\$HEAD_NODE_IP --nnodes \\\$NNODES --node-rank \\\$NODE_RANK \\
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after --bucket-size 1 \\
         2>&1 | tee \\\$LOG_DIR/node_\\\$NODE_RANK.log

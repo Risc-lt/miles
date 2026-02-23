@@ -174,6 +174,13 @@ class RDMATransferManager:
         future = self.executor.submit(fn, *args)
         self.transfer_futures.append(future)
 
+    def submit_returning_future(self, fn: Callable, *args) -> Future:
+        """Submit a callable and return its future (also tracked for bulk waiting)."""
+        self.ensure_started()
+        future = self.executor.submit(fn, *args)
+        self.transfer_futures.append(future)
+        return future
+
     def wait_transfers(self) -> None:
         """Wait for all submitted tasks to complete."""
         for future in self.transfer_futures:
@@ -215,10 +222,11 @@ class TransferBundle:
     def add_remote_session(self, remote_info: RemoteWeightInfo) -> None:
         self.remote_weight_infos.append(remote_info)
 
-    def do_rdma_write(self, names: list[str]) -> None:
-        """RDMA write from CPU pinned memory to remote GPUs.
+    def do_rdma_write_one_session(self, remote_session: RemoteWeightInfo, names: list[str]) -> None:
+        """RDMA write to a single remote session.
 
-        Suitable for submission to RDMATransferManager.submit().
+        Used by the flattened submission path where each (bundle, session) pair
+        is submitted as a separate task to RDMATransferManager.
         """
         source_ptrs, source_lens = [], []
         valid_names = []
@@ -226,7 +234,6 @@ class TransferBundle:
         for name in names:
             cpu_reg = self.weight_memory_registry.get(name)
             if cpu_reg is None:
-                logger.warning(f"[RDMA] Parameter {name} not in weight registry")
                 continue
 
             data_ptr, numel, ele_size = cpu_reg
@@ -237,22 +244,19 @@ class TransferBundle:
         if not source_ptrs:
             return
 
-        for remote_session in self.remote_weight_infos:
-            session_id = remote_session.session_id
-            remote_weights_info = remote_session.weights_info
+        session_id = remote_session.session_id
+        target_ptrs = []
+        for name in valid_names:
+            if name in remote_session.weights_info:
+                target_ptrs.append(remote_session.weights_info[name][0])
 
-            target_ptrs = []
-            for name in valid_names:
-                if name in remote_weights_info:
-                    target_ptrs.append(remote_weights_info[name][0])
+        if len(target_ptrs) != len(source_ptrs):
+            logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
+            return
 
-            if len(target_ptrs) != len(source_ptrs):
-                logger.warning(f"[RDMA] Pointer count mismatch for session {session_id}")
-                continue
-
-            ret = self.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
-            if ret < 0:
-                logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
+        ret = self.engine.batch_transfer_sync_write(session_id, source_ptrs, target_ptrs, source_lens)
+        if ret < 0:
+            logger.error(f"[RDMA] Transfer failed for session {session_id}, error: {ret}")
 
     def get_transfer_ready_params(self, converted_named_tensors: list[tuple[str, torch.Tensor]]) -> list[str]:
         """Track which parameters are ready (all shards loaded)."""
@@ -406,7 +410,13 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
                 transfer_bundle.model_replica.load_weights(converted_named_tensors)
             if transfer_ready_params:
                 with timer("rdma_submit", log_info=False):
-                    self.transfer_manager.submit(transfer_bundle.do_rdma_write, transfer_ready_params)
+                    # Submit one task per remote session (flat, no nesting)
+                    for remote_session in transfer_bundle.remote_weight_infos:
+                        self.transfer_manager.submit(
+                            transfer_bundle.do_rdma_write_one_session,
+                            remote_session,
+                            transfer_ready_params,
+                        )
 
         converted_named_tensors.clear()
 
