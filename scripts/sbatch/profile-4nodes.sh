@@ -1,4 +1,4 @@
-JOBID=5275751
+JOBID=5276407
 EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP=cpu-direct-4node
 
