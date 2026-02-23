@@ -214,11 +214,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         sglang_args += "--sglang-load-format dummy "
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
-    mem = (
-        int(args.bucket_size * 1024 * 1024 * 1024)
-        if is_rdma
-        else (4 * 1024 * 1024 * 1024)
-    )
+    mem = int(args.bucket_size * 1024 * 1024 * 1024)
 
     misc_args = (
         # default dropout in megatron is 0.1
@@ -230,7 +226,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--attention-backend flash "
         f"--actor-num-nodes {args.num_train_gpus // GPUS_PER_NODE} "
         f"--actor-num-gpus-per-node {GPUS_PER_NODE} "
-        # 4GB buffer for weight update
+        # buffer for weight update (controlled by --bucket-size, default 1GB)
         f"--update-weight-buffer-size {mem} "
         # enable correctness check
     )

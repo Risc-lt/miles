@@ -219,11 +219,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         sglang_args += "--sglang-load-format dummy "
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
-    mem = (
-        int(args.bucket_size * 1024 * 1024 * 1024)
-        if is_rdma
-        else (4 * 1024 * 1024 * 1024)
-    )
+    mem = int(args.bucket_size * 1024 * 1024 * 1024)
     # ci_args = "--ci-test "
 
     misc_args = (
