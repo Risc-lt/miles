@@ -244,7 +244,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
             return
 
         # Stage tensors and check which params are now complete
-        with timer("get_transfer_ready_params_shared", log_info=False):
+        with timer("get_transfer_ready_params", log_info=False):
             transfer_ready_params, ready_hf_tensors = self._get_transfer_ready_params(
                 converted_named_tensors
             )
@@ -253,20 +253,20 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         if transfer_ready_params and ready_hf_tensors:
             last_idx = len(self._engine_rank_list) - 1
             for i, info in enumerate(self._engine_rank_list):
-                with timer("load_weights_to_shared_buffer", log_info=False):
+                with timer("load_weights_to_cpu_replica", log_info=False):
                     info.model_replica.load_weights(ready_hf_tensors)
 
                 is_last = i == last_idx
                 if is_last:
                     # Last engine rank: submit to background thread.
-                    with timer("rdma_async_write_shared", log_info=False):
+                    with timer("rdma_async_write", log_info=False):
                         self.transfer_manager.submit(
                             self._do_rdma_write, info, transfer_ready_params
                         )
                 else:
                     # Not the last rank: synchronous write.
                     # Must complete before the next load_weights() overwrites the buffer.
-                    with timer("rdma_sync_write_shared", log_info=False):
+                    with timer("rdma_sync_write", log_info=False):
                         self._do_rdma_write(info, transfer_ready_params)
 
         # Clear the input list (caller convention)
