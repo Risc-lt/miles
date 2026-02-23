@@ -78,6 +78,10 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         self._registered = False
         self._update_pending: dict[str, int] = {}
+        # Staging buffer: accumulate HF tensors across buckets until all shards
+        # for a sglang param are collected. Key = sglang param name, value = list
+        # of (hf_name, tensor) tuples.
+        self._staged_tensors: dict[str, list[tuple[str, torch.Tensor]]] = {}
         num_workers = getattr(args, "rdma_transfer_workers", 4)
         self.transfer_manager = RDMATransferManager(num_workers=num_workers)
 
@@ -229,28 +233,29 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
     def _update_bucket_weights_from_remote(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
     ) -> None:
-        """Load weights into shared buffer, RDMA write per engine rank.
+        """Stage incoming tensors; when all shards for a param are collected,
+        load into shared buffer and RDMA-write per engine rank.
 
-        For ranks 0..N-2: load_weights → synchronous RDMA write (must complete
-        before the next load_weights overwrites the shared buffer).
-        For the last rank: load_weights → submit to background thread (safe because
-        nothing touches the buffer again until the next bucket, and the RDMA write
-        reads from pinned memory that won't be overwritten until then).
+        Only calls load_weights() with complete accumulated tensors, preventing
+        partial writes that would corrupt the shared buffer when different engine
+        ranks have different EP expert-to-local mappings.
         """
         if not self._is_source or not converted_named_tensors:
             return
 
-        # Compute transfer-ready params once (same mapper, same bucket, same result)
+        # Stage tensors and check which params are now complete
         with timer("get_transfer_ready_params_shared", log_info=False):
-            transfer_ready_params = self._get_transfer_ready_params(converted_named_tensors)
+            transfer_ready_params, ready_hf_tensors = self._get_transfer_ready_params(
+                converted_named_tensors
+            )
 
-        # For each engine rank: load_weights → RDMA write
-        last_idx = len(self._engine_rank_list) - 1
-        for i, info in enumerate(self._engine_rank_list):
-            with timer("load_weights_to_shared_buffer", log_info=False):
-                info.model_replica.load_weights(converted_named_tensors)
+        # Only proceed if we have fully-collected params to transfer
+        if transfer_ready_params and ready_hf_tensors:
+            last_idx = len(self._engine_rank_list) - 1
+            for i, info in enumerate(self._engine_rank_list):
+                with timer("load_weights_to_shared_buffer", log_info=False):
+                    info.model_replica.load_weights(ready_hf_tensors)
 
-            if transfer_ready_params:
                 is_last = i == last_idx
                 if is_last:
                     # Last engine rank: submit to background thread.
@@ -264,25 +269,27 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                     with timer("rdma_sync_write_shared", log_info=False):
                         self._do_rdma_write(info, transfer_ready_params)
 
-        # Clear AFTER all engine ranks are processed
+        # Clear the input list (caller convention)
         converted_named_tensors.clear()
 
     def _get_transfer_ready_params(
         self, converted_named_tensors: list[tuple[str, torch.Tensor]]
-    ) -> list[str]:
-        """Determine which sglang params have all shards present so far.
+    ) -> tuple[list[str], list[tuple[str, torch.Tensor]]]:
+        """Determine which sglang params have all shards present, returning their accumulated tensors.
 
-        Uses the shared ParameterMapper — the result is engine-rank-independent
-        since the mapping is a property of model architecture, not parallelism layout.
+        Stages incoming HF tensors in self._staged_tensors until all shards for a
+        sglang param are collected. Only returns tensors for fully-ready params,
+        preventing partial load_weights() calls that would corrupt the shared buffer.
 
-        Uses self._update_pending (persistent across bucket calls) to correctly
-        track multi-shard parameters whose shards span multiple buckets (e.g.,
-        MoE expert weights with EP > 1).
+        Returns:
+            (transfer_ready_param_names, ready_hf_tensors):
+            - transfer_ready_param_names: sglang param names ready for RDMA transfer
+            - ready_hf_tensors: complete list of (hf_name, tensor) tuples for load_weights()
         """
         transfer_ready_params = []
         params_dict = self._shared_params_dict
 
-        for name, _ in converted_named_tensors:
+        for name, tensor in converted_named_tensors:
             mapped_result = self._shared_param_mapper.map(name)
             mapped, num_shards, num_experts = (
                 mapped_result.sglang_name,
@@ -298,6 +305,9 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
             else:
                 total_expected = num_shards
 
+            # Stage the tensor
+            self._staged_tensors.setdefault(mapped, []).append((name, tensor))
+
             if total_expected == 1:
                 transfer_ready_params.append(mapped)
             else:
@@ -308,7 +318,14 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                 if self._update_pending[mapped] == 0:
                     transfer_ready_params.append(mapped)
 
-        return transfer_ready_params
+        # Collect all staged HF tensors for ready params
+        ready_hf_tensors: list[tuple[str, torch.Tensor]] = []
+        for param_name in transfer_ready_params:
+            staged = self._staged_tensors.pop(param_name, [])
+            ready_hf_tensors.extend(staged)
+            self._update_pending.pop(param_name, None)
+
+        return transfer_ready_params, ready_hf_tensors
 
     def _do_rdma_write(self, info: EngineRankInfo, names: list[str]) -> None:
         """RDMA write from shared CPU pinned buffers to remote GPUs.
@@ -356,4 +373,11 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
             return
         self.transfer_manager.wait_transfers()
         self._update_pending = {}
+        if self._staged_tensors:
+            logger.warning(
+                f"[RDMA-Shared] Staging buffer not empty at end of transfer: "
+                f"{len(self._staged_tensors)} params with incomplete shards: "
+                f"{list(self._staged_tensors.keys())}"
+            )
+            self._staged_tensors.clear()
         logger.info("[RDMA-Shared] All transfers complete")
