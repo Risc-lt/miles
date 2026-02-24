@@ -266,7 +266,7 @@ def execute(args: ScriptArgs):
         f"{profile_args} "
     )
     if args.node_rank > 0:
-        time.sleep(20)
+        time.sleep(40)
     os.environ["MODEL_ARGS_ROTARY_BASE"] = "50000"
     # TODO(xinji1): figure it out if the timeout is the root cause of `Batch transfer failed with error code`
     mc_transfer_timeout = "300" if args.released_mc_transfer_timeout else "30"
