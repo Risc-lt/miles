@@ -203,6 +203,8 @@ def execute(args: ScriptArgs):
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 8 "
+        "--sglang-moe-runner-backend triton "
+        "--sglang-fp8-gemm-backend triton "
     )
     if args.mode == "rdma":
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
