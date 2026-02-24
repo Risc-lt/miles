@@ -32,8 +32,6 @@ STEP_LEVEL_TIMERS = {
     "rdma_move_replica_to_cpu",
     "rdma_cpu_registration",
     "on_transfer_start",
-    "rdma_async_write",
-    "rdma_sync_write",
 }
 
 # The timer that marks end of a step
