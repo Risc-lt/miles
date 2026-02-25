@@ -69,7 +69,7 @@ def create_cpu_replica(
 ) -> torch.nn.Module:
     """Create model on GPU (required by sglang), then move to CPU pinned memory."""
     load_config = LoadConfig(
-        load_format="auto",
+        load_format="dummy",
         model_loader_extra_config=server_args.model_loader_extra_config,
         rl_quant_profile=server_args.rl_quant_profile,
     )
