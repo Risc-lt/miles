@@ -177,7 +177,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         from sglang.srt.model_loader import get_model
 
         load_config = LoadConfig(
-            load_format="auto",
+            load_format="dummy",
             model_loader_extra_config=server_args.model_loader_extra_config,
             rl_quant_profile=server_args.rl_quant_profile,
         )
