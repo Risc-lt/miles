@@ -72,6 +72,10 @@ def get_timer_group(timer_name: str) -> str | None:
         return "rdma_submit"
     if timer_name == "expert_convert_to_hf":
         return "expert_convert_to_hf"
+    if timer_name == "rdma_sync_write":
+        return "rdma_sync_write"
+    if timer_name == "rdma_async_write":
+        return "rdma_async_write"
     return None
 
 
@@ -182,18 +186,14 @@ def consolidate_timer_log(input_file: str, output_file: str) -> None:
         for group_name in GROUP_ORDER:
             if group_name in group_accum:
                 total_ms, count = group_accum[group_name]
-                output_lines.append(
-                    f"  {group_name}: {total_ms:.3f}ms total ({count} calls)"
-                )
+                output_lines.append(f"  {group_name}: {total_ms:.3f}ms total ({count} calls)")
                 printed_groups.add(group_name)
 
         # Print any remaining groups not in ORDER
         for group_name in sorted(group_accum):
             if group_name not in printed_groups:
                 total_ms, count = group_accum[group_name]
-                output_lines.append(
-                    f"  {group_name}: {total_ms:.3f}ms total ({count} calls)"
-                )
+                output_lines.append(f"  {group_name}: {total_ms:.3f}ms total ({count} calls)")
 
         # Print step-level timers
         for entry in step_level_entries:

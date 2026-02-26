@@ -20,7 +20,7 @@ EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP="${EXP:-glm355b-standalone}"
 
 # --------------- container / image config ---------------
-IMAGE_PATH="${IMAGE_PATH:-/mnt/nvme/images/docker_images/xinji1_miles.sqsh}"
+IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/jiadongguo/docker_images/xinji1_miles.sqsh}"
 container_mounts="/mnt/vast/checkpoints/jiadongguo/rdma:/data"
 
 # --------------- NCCL / UCX env vars ---------------
@@ -97,7 +97,7 @@ setup_and_run() {
     # ---- run test ----
     echo "Starting test ... MILES_LOG_DIR=${MILES_LOG_DIR}"
     python /root/miles/tests/test_weight_transfer_moe_multinode_glm45_355b_16nodes.py \
-        --multinode --mode rdma-shared --skip-validation \
+        --multinode --mode nccl --skip-validation \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
         --bucket-size '"${BUCKET_SIZE}"' \
