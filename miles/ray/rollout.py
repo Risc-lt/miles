@@ -523,10 +523,37 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             args=args, num_engines=num_engines, rollout_engines=rollout_engines
         )
 
-    # TODO: don't ray.get here to overlap train actor init with rollout engine init.
-    # somehow if we don't sync here, the --debug-rollout-only mode will crash.
-    init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
-    ray.get(init_handles)
+    # Determine if we should use seed-based loading:
+    # Active when engines load real weights (not dummy) AND transfer engine seed flag is set
+    # and there are multiple engines to benefit from seed loading.
+    use_seed_loading = (
+        getattr(args, "sglang_load_format", None) != "dummy"
+        and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
+        and len(rollout_engines) > 1
+    )
+
+    if use_seed_loading:
+        # Step 1: Init seed engine (rank 0) first — it loads from VAST (disk)
+        seed_rank, seed_engine = rollout_engines[0]
+        logger.info(f"Seed loading: initializing engine {seed_rank} as seed (loads from disk)")
+        ray.get(seed_engine.init.remote(**addr_and_ports[seed_rank]))
+
+        # Step 2: Init follower engines with remote_instance pointing to seed
+        seed_host = addr_and_ports[seed_rank]["host"]
+        seed_port = addr_and_ports[seed_rank]["port"]
+
+        follower_handles = []
+        for rank, engine in rollout_engines[1:]:
+            addr_and_ports[rank]["seed_instance_ip"] = seed_host
+            addr_and_ports[rank]["seed_instance_service_port"] = seed_port
+            logger.info(f"Seed loading: engine {rank} will load from seed at {seed_host}:{seed_port}")
+            follower_handles.append(engine.init.remote(**addr_and_ports[rank]))
+
+        ray.get(follower_handles)
+    else:
+        # Original path: all engines init in parallel
+        init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
+        ray.get(init_handles)
 
     return num_new_engines
 
