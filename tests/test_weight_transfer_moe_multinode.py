@@ -61,17 +61,6 @@ MODELS: dict[str, ModelConfig] = {
         train_ep=1,
         train_cp=2,
     ),
-    "glm45-air": ModelConfig(
-        key="glm45-air",
-        model_name="GLM-4.5-Air",
-        hf_repo="zai-org/GLM-4.5-Air",
-        model_type="glm4.5-106B-A12B",
-        train_tp=2,
-        train_ep=4,
-        train_pp=2,
-        decoder_last_pipeline_num_layers=23,
-        sglang_ep=8,
-    ),
     "moonlight": ModelConfig(
         key="moonlight",
         model_name="Moonlight-16B-A3B-Instruct",
