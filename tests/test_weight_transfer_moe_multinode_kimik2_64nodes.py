@@ -205,7 +205,7 @@ def execute(args: ScriptArgs):
         "--sglang-server-concurrency 8 "
         "--sglang-moe-runner-backend triton "
         "--sglang-fp8-gemm-backend triton "
-        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 4}' """
+        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 2}' """
         "--sglang-weight-loader-disable-mmap "
     )
     if args.mode == "rdma":
