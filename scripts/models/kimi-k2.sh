@@ -1,4 +1,4 @@
-NLAYERS=61
+NLAYERS=4
 FIRST_K_DENSE_REPLACE=1
 
 arr=()
@@ -15,7 +15,7 @@ printf -v MOE_LAYER_FREQ "[%s]" "$(IFS=', '; echo "${arr[*]}")"
 # kimi-k2
 MODEL_ARGS=(
     --disable-bias-linear
-    --num-layers 61
+    --num-layers 4
     --hidden-size 7168
     --ffn-hidden-size 18432
     --num-attention-heads 64

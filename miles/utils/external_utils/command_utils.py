@@ -37,7 +37,7 @@ def convert_checkpoint(
     hf_checkpoint = hf_checkpoint or f"/root/models/{model_name}"
 
     # TODO shall we make it in host-mapped folder and thus can cache it to speedup CI
-    path_dst = f"{dir_dst}/{model_name}_torch_dist"
+    path_dst = f"{dir_dst}/{model_name}_torch_dist_4layers"
     if Path(path_dst).exists():
         print(f"convert_checkpoint skip {path_dst} since exists")
         return
