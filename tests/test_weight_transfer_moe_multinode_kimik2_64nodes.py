@@ -192,7 +192,7 @@ def execute(args: ScriptArgs):
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        "--sglang-mem-fraction-static 0.9 "
+        "--sglang-mem-fraction-static 0.7 "
         # "--sglang-enable-dp-attention "
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
