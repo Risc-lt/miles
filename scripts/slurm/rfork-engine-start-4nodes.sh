@@ -102,7 +102,7 @@ setup_and_run() {
     echo "Starting test ... MILES_LOG_DIR=${MILES_LOG_DIR}"
     python /root/miles/tests/test_weight_transfer_moe_multinode.py \
         --multinode --mode all \
-        --models glm4,moonlight,qwen3-30b,qwen3-32b \
+        --models glm45-air \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
         --bucket-size '"${BUCKET_SIZE}"' \

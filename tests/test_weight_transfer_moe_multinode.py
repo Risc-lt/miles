@@ -67,7 +67,9 @@ MODELS: dict[str, ModelConfig] = {
         hf_repo="zai-org/GLM-4.5-Air",
         model_type="glm4.5-106B-A12B",
         train_tp=2,
-        train_ep=8,
+        train_ep=4,
+        train_pp=2,
+        decoder_last_pipeline_num_layers=23,
         sglang_ep=8,
     ),
     "moonlight": ModelConfig(

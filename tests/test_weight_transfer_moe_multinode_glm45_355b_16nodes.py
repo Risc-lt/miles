@@ -65,9 +65,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        U.exec_command(
-            "hf download zai-org/GLM-4.5 --local-dir /root/models/GLM-4.5"
-        )
+        U.exec_command("hf download zai-org/GLM-4.5 --local-dir /root/models/GLM-4.5")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
     num_gpus = args.num_train_gpus + args.num_rollout_gpus
@@ -122,8 +120,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     if args.multinode:
         num_gpus_per_node = 8
         ckpt_args = (
-            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
-            f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
@@ -207,6 +204,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--sglang-cuda-graph-bs 1 2 4 8 16 "
         # GLM-4.5-specific: dense TP size
         "--sglang-moe-dense-tp-size 1 "
+        '--sglang-model-loader-extra-config \'{"enable_multithread_load": true, "num_threads": 8}\''
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
