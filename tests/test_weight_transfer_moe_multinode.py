@@ -1,7 +1,7 @@
 """
 Multi-model 4-node profiling script for RDMA/NCCL weight transfer.
 
-Runs 5 model configs sequentially (NCCL, RDMA, and/or RDMA shared-buffer modes),
+Runs 6 model configs sequentially (NCCL, RDMA, and/or RDMA shared-buffer modes),
 writing timer logs under $MILES_LOG_DIR/4node-profile/<model>/<mode>/.
 Runs 13 steps; average the last 10 for stable profiling numbers.
 
@@ -9,14 +9,13 @@ Usage:
     python test_weight_transfer_moe_multinode.py \
         --multinode --head-node-ip <IP> --node-rank <RANK> --nnodes 4 \
         [--mode nccl|rdma|rdma-shared|all] \
-        [--models llama3,glm4,moonlight,qwen3-30b,qwen3-32b]
+        [--models llama3,glm4,glm45-air,moonlight,qwen3-30b,qwen3-32b]
 """
-
-from dataclasses import dataclass, field
-from typing import Literal
 
 import os
 import time
+from dataclasses import dataclass
+from typing import Literal
 
 import typer
 
@@ -58,14 +57,26 @@ MODELS: dict[str, ModelConfig] = {
         model_name="GLM-Z1-9B-0414",
         hf_repo="zai-org/GLM-Z1-9B-0414",
         model_type="glm4-9B",
-        train_tp=2, train_ep=1, train_cp=2,
+        train_tp=2,
+        train_ep=1,
+        train_cp=2,
+    ),
+    "glm45-air": ModelConfig(
+        key="glm45-air",
+        model_name="GLM-4.5-Air",
+        hf_repo="zai-org/GLM-4.5-Air",
+        model_type="glm4.5-106B-A12B",
+        train_tp=2,
+        train_ep=8,
+        sglang_ep=8,
     ),
     "moonlight": ModelConfig(
         key="moonlight",
         model_name="Moonlight-16B-A3B-Instruct",
         hf_repo="moonshotai/Moonlight-16B-A3B-Instruct",
         model_type="moonlight",
-        train_tp=2, train_ep=8,
+        train_tp=2,
+        train_ep=8,
         sglang_ep=8,
     ),
     "qwen3-30b": ModelConfig(
@@ -73,7 +84,8 @@ MODELS: dict[str, ModelConfig] = {
         model_name="Qwen3-30B-A3B",
         hf_repo="Qwen/Qwen3-30B-A3B",
         model_type="qwen3-30B-A3B",
-        train_tp=4, train_ep=8,
+        train_tp=4,
+        train_ep=8,
         sglang_ep=8,
         rotary_base="1000000",
     ),
@@ -82,7 +94,8 @@ MODELS: dict[str, ModelConfig] = {
         model_name="Qwen3-32B",
         hf_repo="Qwen/Qwen3-32B",
         model_type="qwen3-32B",
-        train_tp=8, train_ep=1,
+        train_tp=8,
+        train_ep=1,
     ),
 }
 
@@ -167,28 +180,29 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
     os.makedirs(run_log_dir, exist_ok=True)
     os.environ["MILES_LOG_DIR"] = run_log_dir
 
-    log_experiment_start({
-        "mode": mode,
-        "model": cfg.model_name,
-        "model_type": cfg.model_type,
-        "num_train_gpus": args.num_train_gpus,
-        "num_rollout_gpus": args.num_rollout_gpus,
-        "train_tp": cfg.train_tp,
-        "train_ep": cfg.train_ep,
-        "train_pp": cfg.train_pp,
-        "train_cp": cfg.train_cp,
-        "train_etp": cfg.train_etp,
-        "sglang_tp": cfg.sglang_tp,
-        "sglang_ep": cfg.sglang_ep,
-        "multinode": args.multinode,
-        "nnodes": args.nnodes,
-        "node_rank": args.node_rank,
-    })
+    log_experiment_start(
+        {
+            "mode": mode,
+            "model": cfg.model_name,
+            "model_type": cfg.model_type,
+            "num_train_gpus": args.num_train_gpus,
+            "num_rollout_gpus": args.num_rollout_gpus,
+            "train_tp": cfg.train_tp,
+            "train_ep": cfg.train_ep,
+            "train_pp": cfg.train_pp,
+            "train_cp": cfg.train_cp,
+            "train_etp": cfg.train_etp,
+            "sglang_tp": cfg.sglang_tp,
+            "sglang_ep": cfg.sglang_ep,
+            "multinode": args.multinode,
+            "nnodes": args.nnodes,
+            "node_rank": args.node_rank,
+        }
+    )
 
     # --- Checkpoint ---
     ckpt_args = (
-        f"--hf-checkpoint /root/models/{cfg.model_name}/ "
-        f"--ref-load /root/multinode/{cfg.model_name}_torch_dist/ "
+        f"--hf-checkpoint /root/models/{cfg.model_name}/ " f"--ref-load /root/multinode/{cfg.model_name}_torch_dist/ "
     )
     if args.no_save_optim:
         ckpt_args += "--no-save-optim "
@@ -254,11 +268,7 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
         sglang_args += "--sglang-load-format dummy "
 
     # --- Misc ---
-    mem = (
-        int(args.bucket_size * 1024 * 1024 * 1024)
-        if is_rdma
-        else (4 * 1024 * 1024 * 1024)
-    )
+    mem = int(args.bucket_size * 1024 * 1024 * 1024) if is_rdma else (4 * 1024 * 1024 * 1024)
     misc_args = (
         "--attention-dropout 0.0 --hidden-dropout 0.0 "
         "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 "
@@ -274,8 +284,6 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
     if mode == "rdma-shared":
         misc_args += "--rdma-shared-buffer "
     misc_args += cfg.extra_train_flags
-
-
 
     # --- Assemble ---
     train_args = (
@@ -323,10 +331,11 @@ def execute(args: ScriptArgs, cfg: ModelConfig, mode: str, base_log_dir: str, is
             # did `ray stop`).  Then stop the local Ray daemon so we can
             # rejoin a fresh cluster for the next mode.
             import ray
+
             while True:
                 try:
                     ray.init(address="auto", ignore_reinit_error=True)
-                    available = ray.available_resources().get("GPU", 0)
+                    ray.available_resources().get("GPU", 0)
                     ray.shutdown()
                     # If the head-node has torn down the cluster the init
                     # call above will raise.  While it still succeeds the
