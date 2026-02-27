@@ -209,7 +209,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 1024 "
-        '--sglang-model-loader-extra-config \'{"enable_multithread_load": true, "num_threads": 8}\''
+        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "

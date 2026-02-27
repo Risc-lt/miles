@@ -209,7 +209,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         f"--sglang-ep-size {args.sglang_ep} "
         "--sglang-enable-dp-lm-head "
         "--sglang-cuda-graph-bs 1 2 4 8 16 "
-        '--sglang-model-loader-extra-config \'{"enable_multithread_load": true, "num_threads": 8}\''
+        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
         # "--sglang-moe-a2a-backend deepep "
     )
     if is_rdma:
