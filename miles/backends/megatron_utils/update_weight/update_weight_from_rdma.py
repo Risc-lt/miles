@@ -396,9 +396,9 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
             (name, tensor) for name, tensor in converted_named_tensors
             if tensor.dtype in (torch.float8_e4m3fn, torch.float8_e5m2, torch.float8_e4m3fnuz, torch.float8_e5m2fnuz)
         ]
-        if fp8_tensors:
+        if fp8_tensors: 
             for name, tensor in fp8_tensors:
-                if "q_b_proj" in name:
+                if "model.layers.0.self_attn.q_b_proj.weight" in name:
                     flat = tensor.flatten()[-5:]
                     logger.info(f"[RDMA] FP8 tensor: {name}, dtype={tensor.dtype}, last 5 elements={flat.tolist()}")
 
