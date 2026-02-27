@@ -16,11 +16,12 @@ import os
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["nccl", "rdma", "rdma-shared", "all"] = "all"
-    # Training parallelism: 32 GPUs, TP=2, EP=16, PP=1 → DP=16
-    # 128 experts / EP=16 = 8 experts per GPU per MoE layer
-    train_tp: int = 2
-    train_ep: int = 16
-    train_pp: int = 1
+    # Recommended 3D parallelism for 32 GPUs (4× H100 nodes):
+    # TP=1 (active params only 12B), PP=4 (handle 106B total), EP=8 (128 experts across nodes)
+    # → DP = 32 / (TP=1 × PP=4) = 8, EP=8 ≤ DP=8 ✓
+    train_tp: int = 1
+    train_ep: int = 8
+    train_pp: int = 4
     train_cp: int = 1
     train_etp: int = 1
     # Rollout parallelism: 4 engines × 8 GPUs each (EP=8, DP_attn)
@@ -34,6 +35,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     head_node_ip: str | None = None
     node_rank: int = 0
     nnodes: int = 8
+    # 46 layers, PP=4: ceil(46/4)=12 per stage, last stage = 46 - 12*3 = 10
+    decoder_last_pipeline_num_layers: int = 10
     wait_after: bool = False
     enable_nccl_nvls: bool = False
     bucket_size: float = 1.0
@@ -72,6 +75,7 @@ def prepare(args: ScriptArgs):
         nnodes=args.nnodes,
         dir_dst="/root/multinode",
         node_rank=args.node_rank,
+        decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
     )
 
 
@@ -120,14 +124,16 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     # --- Training parallelism ---
     perf_args = (
         f"--tensor-model-parallel-size {args.train_tp} "
-        "--sequence-parallel "
         f"--pipeline-model-parallel-size {args.train_pp} "
         f"--context-parallel-size {args.train_cp} "
         f"--expert-model-parallel-size {args.train_ep} "
         f"--expert-tensor-parallel-size {args.train_etp} "
+        f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
         "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
         "--use-dynamic-batch-size --max-tokens-per-gpu 2048 "
     )
+    if args.train_tp > 1:
+        perf_args += "--sequence-parallel "
 
     # --- Eval ---
     eval_args = (
