@@ -81,7 +81,7 @@ def prepare(args: ScriptArgs):
             dir_dst="/root/multinode",
             hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16",
             node_rank=args.node_rank,
-            decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+            # decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
         )
 
 
@@ -151,7 +151,7 @@ def execute(args: ScriptArgs):
         f"--context-parallel-size {args.train_cp} "
         f"--expert-model-parallel-size {args.train_ep} "
         f"--expert-tensor-parallel-size {args.train_etp} "
-        f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
+        # f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
