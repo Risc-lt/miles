@@ -583,6 +583,8 @@ def _compute_server_args(
         kwargs["remote_instance_weight_loader_seed_instance_service_port"] = seed_instance_service_port
         kwargs["remote_instance_weight_loader_backend"] = "transfer_engine"
         kwargs["remote_instance_weight_loader_start_seed_via_transfer_engine"] = True
+        # RemoteInstanceModelLoader does not support model_loader_extra_config
+        kwargs.pop("model_loader_extra_config", None)
 
     unused_keys = set(kwargs.keys())
     for attr in dataclasses.fields(ServerArgs):
