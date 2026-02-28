@@ -11,6 +11,8 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     assert quantization_config["quant_method"] == "fp8"
     assert quantization_config["fmt"] == "e4m3"
     assert quantization_config["activation_scheme"] == "dynamic"
+    # ad-hoc 
+    # 128 first ,then back to 64
     weight_block_size = quantization_config.get("weight_block_size", None)
 
     decoder_layers_pattern = r"module\.module\.decoder\.layers\.(\d+)\.(.+)"
@@ -82,7 +84,7 @@ def quantize_params_fp8(args, megatron_name, converted_named_params, quantizatio
     # for other parameters, we just return the original converted_named_params
     return converted_named_params
 
-
+TARGET_SHAPE = (10, 112)
 def _quantize_param(name, weight, weight_block_size):
     assert name.endswith(".weight"), f"Expected weight parameter, got {name}"
     FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
@@ -91,10 +93,21 @@ def _quantize_param(name, weight, weight_block_size):
         if should_deepgemm_weight_requant_ue8m0 and should_deepgemm_weight_requant_ue8m0(
             weight_block_size=weight_block_size
         ):
+            assert 0 == 1, "should nt this path"
             qweight, scale = quant_weight_ue8m0(weight, weight_block_size=weight_block_size)
             scale = transform_scale_ue8m0(scale, mn=qweight.shape[-2])
         else:
-            qweight, scale = blockwise_cast_to_fp8_triton(weight, weight_block_size)
+
+            real_weight_block_size = [128,128]
+            qweight, scale = blockwise_cast_to_fp8_triton(weight, real_weight_block_size)
+        
+            scale = scale.repeat_interleave(2, dim=0).repeat_interleave(2, dim=1)
+
+            if tuple(scale.shape) == TARGET_SHAPE:
+                scale = scale[:9, :]
+                trimmed += 1
+                # modified = True
+
         scale_name = name.replace(".weight", ".weight_scale_inv")
     else:
         # per tensor quant
