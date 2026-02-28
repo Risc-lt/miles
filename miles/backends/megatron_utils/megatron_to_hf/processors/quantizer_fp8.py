@@ -105,7 +105,6 @@ def _quantize_param(name, weight, weight_block_size):
 
             if tuple(scale.shape) == TARGET_SHAPE:
                 scale = scale[:9, :]
-                trimmed += 1
                 # modified = True
 
         scale_name = name.replace(".weight", ".weight_scale_inv")
