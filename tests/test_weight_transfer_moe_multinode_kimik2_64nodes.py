@@ -200,7 +200,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        "--sglang-mem-fraction-static 0.75 "
+        "--sglang-mem-fraction-static 0.7 "
         "--sglang-enable-dp-attention "
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
@@ -209,6 +209,8 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 1024 "
+        "--sglang-moe-runner-backend triton "
+        "--sglang-fp8-gemm-backend triton "
         """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
     )
     if is_rdma:
