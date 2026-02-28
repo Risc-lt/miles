@@ -400,7 +400,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         for name, tensor in converted_named_tensors:
             if "model.layers.0.self_attn.q_b_proj.weight" in name:
                 flat = tensor.flatten()[-5:]
-                logger.info(f"[RDMA] q_b_proj.weight tensor: {name}, dtype={tensor.dtype}, last 5 elements={flat.tolist()}")
+                logger.info(f"[RDMA] q_b_proj.weight tensor: {name}, dtype={tensor.dtype}, size{tensor.size()},  last 5 elements={flat.tolist()}")
 
         # 1. Record event on default stream: all_gather data for this bucket is ready
         event = torch.cuda.Event()
