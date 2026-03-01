@@ -218,8 +218,8 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--sglang-fp8-gemm-backend triton "
 
     )
-    # if is_rdma:
-    #     sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    if is_rdma:
+        sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.skip_validation:
         sglang_args += "--sglang-load-format dummy "
     else:

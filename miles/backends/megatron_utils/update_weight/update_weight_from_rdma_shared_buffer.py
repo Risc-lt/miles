@@ -178,7 +178,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         load_config = LoadConfig(
             load_format="dummy",
-            model_loader_extra_config=server_args.model_loader_extra_config,
+            model_loader_extra_config=None,
             rl_quant_profile=server_args.rl_quant_profile,
         )
         server_args_module._global_server_args = server_args
