@@ -16,7 +16,7 @@
 # Standalone sbatch script – GLM-4.5-355B  (16 nodes, 128 GPUs)
 # =============================================================================
 
-EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
+EXEC_DATE=$(date +%Y-%m-%d_%H-%M-%S)
 EXP="${EXP:-glm355b-standalone}"
 
 # --------------- container / image config ---------------

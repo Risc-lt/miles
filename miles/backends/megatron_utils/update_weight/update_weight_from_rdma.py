@@ -26,6 +26,7 @@ from .update_weight_from_remote import UpdateWeightFromRemote
 
 logger = logging.getLogger(__name__)
 
+
 def create_server_args_from_dict(data_dict: dict) -> ServerArgs:
     valid_fields = {f.name for f in dataclasses.fields(ServerArgs)}
     filtered_data = {k: v for k, v in data_dict.items() if k in valid_fields}
@@ -70,7 +71,7 @@ def create_cpu_replica(
     """Create model on GPU (required by sglang), then move to CPU pinned memory."""
     load_config = LoadConfig(
         load_format="dummy",
-        model_loader_extra_config=server_args.model_loader_extra_config,
+        model_loader_extra_config=None,
         rl_quant_profile=server_args.rl_quant_profile,
     )
     server_args_module._global_server_args = server_args
@@ -94,10 +95,7 @@ def create_cpu_replica(
     torch.cuda.empty_cache()
 
     total_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    logger.info(
-        f"[RDMA] CPU pinned replica: {gpu_params} params, "
-        f"{total_bytes / (1024**3):.2f} GB"
-    )
+    logger.info(f"[RDMA] CPU pinned replica: {gpu_params} params, " f"{total_bytes / (1024**3):.2f} GB")
     print_memory("[RDMA] After moving replica to CPU and freeing GPU")
     return model
 
@@ -120,19 +118,13 @@ def query_remote_weight_infos(
         session_id, weights_info = ray.get(
             rollout_engines[engine_ind].get_remote_instance_transfer_engine_info.remote(rank=engine_rank)
         )
-        parallelism_info = ray.get(
-            rollout_engines[engine_ind].get_parallelism_info.remote(rank=engine_rank)
-        )
+        parallelism_info = ray.get(rollout_engines[engine_ind].get_parallelism_info.remote(rank=engine_rank))
 
         session_id_to_server_args[session_id] = create_server_args_from_dict(
             ray.get(rollout_engines[engine_ind].get_server_info.remote())
         )
-        assert session_id is not None, (
-            f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
-        )
-        logger.info(
-            f"[RDMA] Obtained remote {session_id} info from rollout engine {engine_ind} rank {engine_rank}"
-        )
+        assert session_id is not None, f"Failed to get session id from rollout engine {engine_ind} rank {engine_rank}"
+        logger.info(f"[RDMA] Obtained remote {session_id} info from rollout engine {engine_ind} rank {engine_rank}")
         logger.info(f"[RDMA] Remote weight info has {len(weights_info)} tensors.")
         remote_weight_infos_by_session_id[session_id] = (weights_info, parallelism_info)
         targets_to_session_id[(engine_ind, engine_rank)] = session_id
@@ -391,9 +383,7 @@ class UpdateWeightFromRDMA(UpdateWeightFromRemote):
         if not self._registered:
             with timer("rdma_cpu_registration"):
                 for bundle in self.engines.values():
-                    bundle.weight_memory_registry = register_cpu_memory_region(
-                        bundle.params_dict, bundle.engine
-                    )
+                    bundle.weight_memory_registry = register_cpu_memory_region(bundle.params_dict, bundle.engine)
             self._registered = True
 
     def _update_bucket_weights_from_remote(

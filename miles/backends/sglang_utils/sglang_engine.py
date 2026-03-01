@@ -113,7 +113,17 @@ class SGLangEngine(RayActor):
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
 
-    def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None, node_hosts=None):
+    def init(
+        self,
+        dist_init_addr,
+        port,
+        nccl_port,
+        host=None,
+        disaggregation_bootstrap_port=None,
+        node_hosts=None,
+        seed_instance_ip=None,
+        seed_instance_service_port=None,
+    ):
         self.router_ip = self.args.sglang_router_ip
         self.router_port = self.args.sglang_router_port
 
@@ -144,6 +154,8 @@ class SGLangEngine(RayActor):
             disaggregation_bootstrap_port,
             base_gpu_id=self.base_gpu_id,
             node_hosts=node_hosts,
+            seed_instance_ip=seed_instance_ip,
+            seed_instance_service_port=seed_instance_service_port,
         )
 
         self.node_rank = server_args_dict["node_rank"]
@@ -512,6 +524,8 @@ def _compute_server_args(
     disaggregation_bootstrap_port: int | None = None,
     base_gpu_id: int | None = None,
     node_hosts: str | None = None,
+    seed_instance_ip: str | None = None,
+    seed_instance_service_port: int | None = None,
 ):
     nnodes = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
     node_rank = rank % nnodes
@@ -561,6 +575,17 @@ def _compute_server_args(
     if node_hosts is not None and nnodes > 1:
         kwargs["node_hosts"] = node_hosts
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
+
+    # Override load_format for follower engines that load from a seed
+    if seed_instance_ip is not None and seed_instance_service_port is not None:
+        kwargs["load_format"] = "remote_instance"
+        kwargs["remote_instance_weight_loader_seed_instance_ip"] = seed_instance_ip
+        kwargs["remote_instance_weight_loader_seed_instance_service_port"] = seed_instance_service_port
+        kwargs["remote_instance_weight_loader_backend"] = "transfer_engine"
+        kwargs["remote_instance_weight_loader_start_seed_via_transfer_engine"] = True
+        # RemoteInstanceModelLoader does not support model_loader_extra_config;
+        # set to None (rather than pop) so the generic sglang_* loop won't re-inject it.
+        kwargs["model_loader_extra_config"] = None
 
     unused_keys = set(kwargs.keys())
     for attr in dataclasses.fields(ServerArgs):

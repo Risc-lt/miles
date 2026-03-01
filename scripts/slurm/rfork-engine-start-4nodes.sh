@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH -D ./
-#SBATCH --job-name=kimik2-test
+#SBATCH --job-name=rfork-4node-test
 #SBATCH --output=output.%j.out
 #SBATCH --error=error.%j.err
 #SBATCH --time=72:00:00
-#SBATCH --nodes=64
-#SBATCH --ntasks=64
+#SBATCH --nodes=4
+#SBATCH --ntasks=4
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=8
 #SBATCH --partition=hpc-high
@@ -13,14 +13,18 @@
 #SBATCH --cpus-per-gpu=16
 
 # =============================================================================
-# Standalone sbatch script – Kimi-K2  (64 nodes, 512 GPUs)
+# Standalone sbatch script – seed-based engine start (4 nodes, 32 GPUs)
+#
+# Runs test_weight_transfer_moe_multinode.py for ALL models (glm4, moonlight,
+# qwen3-30b, qwen3-32b) across ALL transfer modes (nccl, rdma, rdma-shared)
+# using the jd/rfork-engine-start miles branch.
 # =============================================================================
 
 EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
-EXP="${EXP:-kimik2-standalone}"
+EXP="${EXP:-rfork-engine-start}"
 
 # --------------- container / image config ---------------
-IMAGE_PATH="${IMAGE_PATH:-/mnt/nvme/images/docker_images/xinji1_miles.sqsh}"
+IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/jiadongguo/docker_images/xinji1_miles.sqsh}"
 container_mounts="/mnt/vast/checkpoints/jiadongguo/rdma:/data"
 
 # --------------- NCCL / UCX env vars ---------------
@@ -87,7 +91,7 @@ setup_and_run() {
     ln -sf /data/multinode /root/multinode
 
     # ---- log dir (on vast mount) ----
-    LOG_DIR="/data/logs/kimik2/'"${EXEC_DATE}-${EXP}"'"
+    LOG_DIR="/data/logs/rfork-4node/'"${EXEC_DATE}-${EXP}"'"
     mkdir -p "${LOG_DIR}"
     export MILES_LOG_DIR="${LOG_DIR}"
 
@@ -96,8 +100,9 @@ setup_and_run() {
 
     # ---- run test ----
     echo "Starting test ... MILES_LOG_DIR=${MILES_LOG_DIR}"
-    python /root/miles/tests/test_weight_transfer_moe_multinode_kimik2_64nodes.py \
-        --multinode --mode nccl --skip-validation \
+    python /root/miles/tests/test_weight_transfer_moe_multinode.py \
+        --multinode --mode all \
+        --models glm45-air \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
         --bucket-size '"${BUCKET_SIZE}"' \
@@ -114,7 +119,7 @@ setup_and_run() {
 
         echo ""
         echo "=== Results directory structure ==="
-        find "${LOG_DIR}/kimik2-profile" -type f -name "*.log" 2>/dev/null | sort
+        find "${LOG_DIR}/4node-profile" -type f -name "*.log" 2>/dev/null | sort
         echo ""
         echo "Profiling complete"
     fi
