@@ -74,7 +74,14 @@ def init(args):
         args.te_rng_tracker,
         args.inference_rng_tracker,
     )
-    _build_tokenizer(args)
+    # Serialize tokenizer build to prevent concurrent dynamic module writing race condition.
+    # When trust_remote_code=True, HuggingFace copies tokenization_kimi.py to cache and imports it.
+    # Multiple ranks doing this simultaneously causes file corruption / incomplete module loads.
+    if args.rank == 0:
+        _build_tokenizer(args)
+    torch.distributed.barrier()
+    if args.rank != 0:
+        _build_tokenizer(args)
     # We won't use this. initialize to pass some validation in megatron.
     init_num_microbatches_calculator(
         args.rank,
