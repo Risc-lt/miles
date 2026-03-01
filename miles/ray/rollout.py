@@ -526,11 +526,12 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     # Determine if we should use seed-based loading:
     # Active when engines load real weights (not dummy) AND transfer engine seed flag is set
     # and there are multiple engines to benefit from seed loading.
-    use_seed_loading = (
-        getattr(args, "sglang_load_format", None) != "dummy"
-        and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
-        and len(rollout_engines) > 1
-    )
+    # use_seed_loading = (
+    #     getattr(args, "sglang_load_format", None) != "dummy"
+    #     and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
+    #     and len(rollout_engines) > 1
+    # )
+    use_seed_loading = False
 
     if use_seed_loading:
         # Step 1: Init seed engine (rank 0) first — it loads from VAST (disk)
