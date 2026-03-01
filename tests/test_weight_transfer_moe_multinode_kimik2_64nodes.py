@@ -50,6 +50,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     released_mc_transfer_timeout: bool = False
     no_save_optim: bool = False
     skip_validation: bool = False
+    # Debug flags for NCCL deadlock isolation
+    disable_dynamic_batch_size: bool = False  # Step 4: skip _communicate_shapes code path
 
     def validate(self):
         if self.multinode:
@@ -170,9 +172,12 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
-        "--use-dynamic-batch-size "
-        "--max-tokens-per-gpu 16384 "
+        + ("" if args.disable_dynamic_batch_size else "--use-dynamic-batch-size ")
+        + "--max-tokens-per-gpu 16384 "
     )
+    if args.disable_dynamic_batch_size:
+        # When dynamic batch size is disabled, must specify a fixed micro-batch-size
+        perf_args += "--micro-batch-size 1 "
 
     # Evaluation settings
     eval_args = (
@@ -287,6 +292,9 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
             "MILES_LOG_DIR": run_log_dir,
+            # Debug: NCCL communicator deadlock during first training step
+            "NCCL_DEBUG": "INFO",
+            "TORCH_NCCL_ASYNC_ERROR_HANDLING": "1",
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,

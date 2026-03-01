@@ -24,7 +24,7 @@ IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/jiadongguo/docker_images/xinji1_
 container_mounts="/mnt/vast/checkpoints/jiadongguo/rdma:/data"
 
 # --------------- NCCL / UCX env vars ---------------
-export NCCL_DEBUG=WARN \
+export NCCL_DEBUG=INFO \
     UCX_IB_PCI_RELAXED_ORDERING=on \
     UCX_TLS=tcp \
     CUDA_DEVICE_ORDER=PCI_BUS_ID \
@@ -78,7 +78,7 @@ setup_and_run() {
     cd /root/miles
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
     git fetch lt --quiet
-    git reset --hard lt/jd/rdma-sharable-cpu-replica
+    git reset --hard lt/jd/kimi-nccl-debug
 
     # ---- symlinks ----
     rm -rf /root/models /root/datasets /root/multinode
@@ -100,7 +100,7 @@ setup_and_run() {
         --multinode --mode all --skip-validation \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
-        --bucket-size '"${BUCKET_SIZE}"' \
+        --bucket-size '"${BUCKET_SIZE}"' --disable-dynamic-batch-size  \
         2>&1 | tee "${LOG_DIR}/node_${NODE_RANK}.log"
 
     # ---- head-node post-processing ----

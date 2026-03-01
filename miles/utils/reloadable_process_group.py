@@ -98,7 +98,7 @@ def monkey_patch_torch_dist():
                     arg = old_irecv
                 return arg
 
-            args = (convert(arg) for arg in args)
+            args = tuple(convert(arg) for arg in args)
             kwargs = {k: convert(v) for k, v in kwargs.items()}
             return func(*args, **kwargs)
 

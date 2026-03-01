@@ -410,6 +410,22 @@ def train_one_step(
         )
 
     # Forward pass.
+    # Debug: Log PP topology on first step to diagnose NCCL communicator deadlock
+    if rollout_id == 0 and step_id == 0:
+        rank = torch.distributed.get_rank()
+        config = get_model_config(model[0])
+        logger.info(
+            f"[NCCL_DEBUG] Rank {rank}: "
+            f"PP_rank={mpu.get_pipeline_model_parallel_rank()}, "
+            f"PP_size={mpu.get_pipeline_model_parallel_world_size()}, "
+            f"PP_prev={mpu.get_pipeline_model_parallel_prev_rank()}, "
+            f"PP_next={mpu.get_pipeline_model_parallel_next_rank()}, "
+            f"TP_rank={mpu.get_tensor_model_parallel_rank()}, "
+            f"CP_rank={getattr(mpu, 'get_context_parallel_rank', lambda: 'N/A')()}, "
+            f"CP_size={getattr(mpu, 'get_context_parallel_world_size', lambda: 'N/A')()}, "
+            f"variable_seq_lengths={getattr(config, 'variable_seq_lengths', 'UNSET')}, "
+            f"num_microbatches={num_microbatches}"
+        )
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func=forward_step,
@@ -689,9 +705,10 @@ def save(
     def _sequential_write(transform_list, use_msc, rank, write_buckets, global_results_queue):
         """Write checkpoint files sequentially in the parent process (no fork)."""
         import gc
-        import os
         import inspect
+        import os
         from time import time
+
         from torch.distributed.checkpoint.filesystem import _write_item
 
         gc_was_enabled = gc.isenabled()
@@ -704,6 +721,7 @@ def save(
             extra_kwargs = {}
             if "serialization_format" in inspect.signature(_write_item).parameters:
                 from torch.distributed.checkpoint.filesystem import SerializationFormat
+
                 extra_kwargs["serialization_format"] = SerializationFormat.TORCH_SAVE
 
             for i, write_bucket in enumerate(write_buckets):
