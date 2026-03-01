@@ -21,7 +21,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Training parallelism (matches colocated run-kimi-k2-Instruct.sh)
     train_tp: int = 8
     train_ep: int = 32
-    train_pp: int = 8
+    train_pp: int = 1
     train_cp: int = 4
     train_etp: int = 1
     # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
@@ -30,8 +30,8 @@ class ScriptArgs(U.ExecuteTrainConfig):
     sglang_ep: int = 32
     sglang_pp: int = 1
     # Total Resources: 64 nodes = 512 GPUs, split 50/50
-    num_train_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
-    num_rollout_gpus: int = 32 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
+    num_train_gpus: int = 4 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
+    num_rollout_gpus: int = 4 * GPUS_PER_NODE  # 32 nodes * 8 GPUs = 256
     # Optimizations
     pipelined_transfer: bool = False
     # multi-node settings
@@ -47,8 +47,6 @@ class ScriptArgs(U.ExecuteTrainConfig):
     released_mc_transfer_timeout: bool = False
     no_save_optim: bool = False
     skip_validation: bool = False
-    hf_checkpoint: str = f"/root/models/{MODEL_NAME}/"
-    ref_load: str = f"/root/multinode/{MODEL_NAME}_torch_dist/"
 
     def validate(self):
         if self.multinode:
@@ -71,7 +69,8 @@ def prepare(args: ScriptArgs):
         # U.exec_command(f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
-    # num_gpus = args.num_train_gpus + args.num_rollout_gpus
+    num_gpus = args.num_train_gpus + args.num_rollout_gpus
+    
     # if not args.multinode:
     #     U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
     # else:
@@ -86,8 +85,8 @@ def prepare(args: ScriptArgs):
     #         dir_dst="/root/multinode",
     #         hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16/",
     #         node_rank=args.node_rank,
-    #         decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
-    #         extra_args=" --expert-model-parallel-size 8",
+    #         # decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+    #         # extra_args=" --expert-model-parallel-size 8",
     #     )
 
 
@@ -125,14 +124,13 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     if args.multinode:
         num_gpus_per_node = 8
         ckpt_args = (
-            f"--hf-checkpoint {args.hf_checkpoint} "
-            f"--ref-load {args.ref_load} "
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist_4layers/ "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
         ckpt_args = (
-            f"--hf-checkpoint {args.hf_checkpoint} "
-            f"--ref-load {args.ref_load} "
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
+            f"--ref-load /root/{MODEL_NAME}_torch_dist "
             f"--load /root/{MODEL_NAME}_slime "
             f"--save /root/{MODEL_NAME}_slime "
         )
@@ -163,7 +161,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         f"--context-parallel-size {args.train_cp} "
         f"--expert-model-parallel-size {args.train_ep} "
         f"--expert-tensor-parallel-size {args.train_etp} "
-        f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
+        # f"--decoder-last-pipeline-num-layers {args.decoder_last_pipeline_num_layers} "
         "--recompute-granularity full "
         "--recompute-method uniform "
         "--recompute-num-layers 1 "
@@ -210,20 +208,19 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         f"--sglang-ep-size {args.sglang_ep} "
         "--sglang-enable-dp-lm-head "
         # "--sglang-cuda-graph-bs 1 2 4 8 16 "
-        "--sglang-disable-cuda-graph "
+         "--sglang-disable-cuda-graph "
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 1024 "
         "--sglang-moe-runner-backend triton "
         "--sglang-fp8-gemm-backend triton "
-
+        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
+        """--sglang-json-model-override-args '{"json-model-override-args": 4}' """
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.skip_validation:
         sglang_args += "--sglang-load-format dummy "
-    else:
-        sglang_args +=         """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = int(args.bucket_size * 1024 * 1024 * 1024)
