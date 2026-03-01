@@ -6,7 +6,7 @@ import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
 MODEL_NAME = "Kimi-K2-Instruct"
-MODEL_TYPE = "kimi-k2"
+MODEL_TYPE = "deepseek-v3"
 import time
 
 GPUS_PER_NODE = 8
