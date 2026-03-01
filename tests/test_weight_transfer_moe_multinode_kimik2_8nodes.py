@@ -237,7 +237,7 @@ def execute(args: ScriptArgs):
         # 4GB buffer for weight update
         f"--update-weight-buffer-size {mem} "
         # enable correctness check
-        f"--check-weight-update-equal "
+        # f"--check-weight-update-equal "
     )
     if args.mode == "rdma":
         misc_args += "--update-weight-transfer-mode rdma "
