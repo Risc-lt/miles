@@ -78,7 +78,7 @@ setup_and_run() {
     cd /root/miles
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
     git fetch lt --quiet
-    git reset --hard lt/jd/rfork-engine-start
+    git reset --hard lt/jd/rdma-sharable-cpu-replica
 
     # ---- symlinks ----
     rm -rf /root/models /root/datasets /root/multinode
@@ -97,7 +97,7 @@ setup_and_run() {
     # ---- run test ----
     echo "Starting test ... MILES_LOG_DIR=${MILES_LOG_DIR}"
     python /root/miles/tests/test_weight_transfer_moe_multinode_kimik2_64nodes.py \
-        --multinode --mode nccl --skip-validation \
+        --multinode --mode all --skip-validation \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
         --bucket-size '"${BUCKET_SIZE}"' \
