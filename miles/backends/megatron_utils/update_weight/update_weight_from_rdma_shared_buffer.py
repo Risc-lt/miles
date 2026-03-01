@@ -125,9 +125,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                 if first_engine_rank:
                     # First engine rank: create full CPU pinned replica → shared buffers
                     logger.info(f"[RDMA-Shared] Creating shared CPU pinned replica from engine rank {engine_rank}")
-                    model_replica = create_cpu_replica(
-                        parallelism_config, self.args.hf_checkpoint, server_args
-                    )
+                    model_replica = create_cpu_replica(parallelism_config, self.args.hf_checkpoint, server_args)
                     self._shared_params_dict = dict(model_replica.named_parameters())
                     self._shared_param_mapper = ParameterMapper.from_model(model_replica)
                     print_memory(f"[RDMA-Shared] After shared CPU pinned replica for engine rank {engine_rank}")
@@ -144,9 +142,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                 remote_infos = []
                 for target in rank_targets:
                     sid = targets_to_session_id[(target.engine_ind, target.engine_rank)]
-                    remote_infos.append(
-                        RemoteWeightInfo(sid, self.remote_weight_infos_by_session_id[sid][0])
-                    )
+                    remote_infos.append(RemoteWeightInfo(sid, self.remote_weight_infos_by_session_id[sid][0]))
 
                 self._engine_rank_infos[engine_rank] = EngineRankInfo(
                     engine_rank=engine_rank,
@@ -178,7 +174,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         load_config = LoadConfig(
             load_format="dummy",
-            model_loader_extra_config=server_args.model_loader_extra_config,
+            model_loader_extra_config=None,
             rl_quant_profile=server_args.rl_quant_profile,
         )
         server_args_module._global_server_args = server_args
@@ -195,9 +191,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
         # Point all params to shared pinned buffers (no new CPU allocation)
         for name, param in model.named_parameters():
             if name not in self._shared_params_dict:
-                logger.warning(
-                    f"[RDMA-Shared] Parameter {name} not found in shared buffers, skipping"
-                )
+                logger.warning(f"[RDMA-Shared] Parameter {name} not found in shared buffers, skipping")
                 continue
             param.data = self._shared_params_dict[name]
 
@@ -225,9 +219,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         if not self._registered:
             with timer("rdma_cpu_registration"):
-                self._weight_memory_registry = register_cpu_memory_region(
-                    self._shared_params_dict, self._engine
-                )
+                self._weight_memory_registry = register_cpu_memory_region(self._shared_params_dict, self._engine)
             self._registered = True
 
     def _update_bucket_weights_from_remote(
@@ -245,9 +237,7 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
 
         # Stage tensors and check which params are now complete
         with timer("get_transfer_ready_params", log_info=False):
-            transfer_ready_params, ready_hf_tensors = self._get_transfer_ready_params(
-                converted_named_tensors
-            )
+            transfer_ready_params, ready_hf_tensors = self._get_transfer_ready_params(converted_named_tensors)
 
         # Only proceed if we have fully-collected params to transfer
         if transfer_ready_params and ready_hf_tensors:
@@ -263,7 +253,9 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                         for remote_session in info.remote_weight_infos:
                             self.transfer_manager.submit(
                                 self._do_rdma_write_one_session,
-                                info, remote_session, transfer_ready_params,
+                                info,
+                                remote_session,
+                                transfer_ready_params,
                             )
                 else:
                     # Non-last rank: fan out sessions in parallel, then wait
@@ -272,7 +264,9 @@ class UpdateWeightFromRDMASharedBuffer(UpdateWeightFromRemote):
                         futures = [
                             self.transfer_manager.submit_returning_future(
                                 self._do_rdma_write_one_session,
-                                info, remote_session, transfer_ready_params,
+                                info,
+                                remote_session,
+                                transfer_ready_params,
                             )
                             for remote_session in info.remote_weight_infos
                         ]

@@ -209,13 +209,15 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         f"--sglang-ep-size {args.sglang_ep} "
         "--sglang-enable-dp-lm-head "
         "--sglang-cuda-graph-bs 1 2 4 8 16 "
-        """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
         # "--sglang-moe-a2a-backend deepep "
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.skip_validation:
         sglang_args += "--sglang-load-format dummy "
+    else:
+        sglang_args += """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
+
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = int(args.bucket_size * 1024 * 1024 * 1024) if is_rdma else (4 * 1024 * 1024 * 1024)
