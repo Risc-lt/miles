@@ -69,24 +69,24 @@ def prepare(args: ScriptArgs):
         # U.exec_command(f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
-    num_gpus = args.num_train_gpus + args.num_rollout_gpus
-    if not args.multinode:
-        U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
-    else:
-        # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
-        U.convert_checkpoint(
-            model_name=MODEL_NAME,
-            megatron_model_type=MODEL_TYPE,
-            num_gpus_per_node=GPUS_PER_NODE,
-            multinode=True,
-            master_addr=args.head_node_ip,
-            nnodes=args.nnodes,
-            dir_dst="/root/multinode",
-            hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16/",
-            node_rank=args.node_rank,
-            decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
-            extra_args=" --expert-model-parallel-size 8",
-        )
+    # num_gpus = args.num_train_gpus + args.num_rollout_gpus
+    # if not args.multinode:
+    #     U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
+    # else:
+    #     # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
+    #     U.convert_checkpoint(
+    #         model_name=MODEL_NAME,
+    #         megatron_model_type=MODEL_TYPE,
+    #         num_gpus_per_node=GPUS_PER_NODE,
+    #         multinode=True,
+    #         master_addr=args.head_node_ip,
+    #         nnodes=args.nnodes,
+    #         dir_dst="/root/multinode",
+    #         hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16/",
+    #         node_rank=args.node_rank,
+    #         decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+    #         extra_args=" --expert-model-parallel-size 8",
+    #     )
 
 
 def execute(args: ScriptArgs, mode: str, base_log_dir: str):
