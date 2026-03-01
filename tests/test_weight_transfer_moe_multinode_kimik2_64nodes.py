@@ -218,12 +218,12 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--sglang-fp8-gemm-backend triton "
 
     )
-    if is_rdma:
-        sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
+    # if is_rdma:
+    #     sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.skip_validation:
         sglang_args += "--sglang-load-format dummy "
     else:
-        sglang_args +=         """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
+        sglang_args += """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = int(args.bucket_size * 1024 * 1024 * 1024)
