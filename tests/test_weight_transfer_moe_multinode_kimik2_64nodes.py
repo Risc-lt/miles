@@ -1,7 +1,10 @@
 # TODO(jensen): may need to merge this file into the main test file in the future.
 from dataclasses import dataclass
 from typing import Literal
+
 import typer
+from transformers import AutoTokenizer
+
 import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
@@ -87,6 +90,10 @@ def prepare(args: ScriptArgs):
     #         decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
     #         extra_args=" --expert-model-parallel-size 8",
     #     )
+
+    # Force Warm
+    tokenizer = AutoTokenizer.from_pretrained(f"/root/models/{MODEL_NAME}/", trust_remote_code=True)
+    print("Tokenizer loaded, vocab size:", tokenizer.vocab_size)
 
 
 def execute(args: ScriptArgs, mode: str, base_log_dir: str):
