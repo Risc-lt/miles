@@ -148,6 +148,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # empty cache after initialization
         clear_memory()
 
+        # Warmup NCCL communicators to avoid lazy init timeout during first forward pass
+        self._warmup_nccl_communicators()
+
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
@@ -164,6 +167,39 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    def _warmup_nccl_communicators(self):
+        """Force eager NCCL communicator creation for PP P2P to avoid lazy init timeout."""
+        pp_size = mpu.get_pipeline_model_parallel_world_size()
+        if pp_size <= 1:
+            return
+
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_group = mpu.get_pipeline_model_parallel_group()
+
+        dummy = torch.zeros(1, device=torch.cuda.current_device())
+
+        # Forward direction warmup: each rank sends to next, receives from prev
+        if pp_rank > 0:
+            dist.recv(dummy, src=mpu.get_pipeline_model_parallel_prev_rank(), group=pp_group)
+        if pp_rank < pp_size - 1:
+            dist.send(dummy, dst=mpu.get_pipeline_model_parallel_next_rank(), group=pp_group)
+
+        # Backward direction warmup
+        if pp_rank < pp_size - 1:
+            dist.recv(dummy, src=mpu.get_pipeline_model_parallel_next_rank(), group=pp_group)
+        if pp_rank > 0:
+            dist.send(dummy, dst=mpu.get_pipeline_model_parallel_prev_rank(), group=pp_group)
+
+        # Also warmup CP group if context_parallel_size > 1
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size > 1:
+            cp_group = mpu.get_context_parallel_group()
+            dummy_cp = torch.zeros(1, device=torch.cuda.current_device())
+            dist.all_reduce(dummy_cp, group=cp_group)
+
+        dist.barrier()
+        logger.info(f"[NCCL Warmup] PP={pp_size}, CP={cp_size} communicators warmed up")
 
     @timer
     def sleep(self) -> None:
