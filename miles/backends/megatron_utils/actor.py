@@ -151,6 +151,9 @@ class MegatronTrainRayActor(TrainRayActor):
         # Warmup NCCL communicators to avoid lazy init timeout during first forward pass
         self._warmup_nccl_communicators()
 
+        # Pre-initialize DeepEP buffer to avoid lazy nvshmem init blocking during pipeline forward
+        self._warmup_deepep_buffer()
+
         if self.args.offload_train:
             # recover to actor in the end.
             self._switch_model("actor")
@@ -273,6 +276,55 @@ class MegatronTrainRayActor(TrainRayActor):
         dist.barrier()
         logger.info(f"[NCCL Warmup] PP={pp_size}, CP={cp_size} communicators warmed up "
                      f"(unbatched + batched P2P on pp_group + WORLD group)")
+
+    def _warmup_deepep_buffer(self):
+        """Pre-initialize DeepEP Buffer (nvshmem) to avoid lazy init during pipeline forward.
+
+        DeepEP's Buffer() constructor calls nvshmem_init/nvshmem_team_split internally,
+        which are collective operations requiring all ranks in the EP group to participate.
+        In the pipeline schedule, different PP stages enter forward_step at different times.
+        If Buffer() is lazily initialized inside the first forward_step, the nvshmem collective
+        can block until all EP group members arrive — but in a pipeline, some ranks may be
+        waiting on P2P recv from an earlier stage that is itself blocked on nvshmem init,
+        causing a deadlock-like timeout.
+
+        This method pre-initializes the buffer before the pipeline schedule begins,
+        ensuring all ranks have completed nvshmem setup.
+        """
+        if not getattr(self.args, 'moe_enable_deepep', False):
+            return
+
+        try:
+            from megatron.core.transformer.moe.fused_a2a import get_buffer, HAVE_DEEP_EP
+            if not HAVE_DEEP_EP:
+                return
+        except ImportError:
+            return
+
+        # Get the EP group used by the flex dispatcher (tp_ep_group)
+        ep_group = None
+        try:
+            ep_group = mpu.get_expert_model_parallel_group()
+        except Exception:
+            pass
+
+        if ep_group is None:
+            return
+
+        # Compute hidden_bytes matching what forward_step will use:
+        # hidden_size * max(element_size_bf16, 2) = hidden_size * 2
+        hidden_bytes = self.args.hidden_size * 2  # bf16
+
+        logger.info(f"[DeepEP Warmup] Pre-initializing DeepEP Buffer "
+                    f"(ep_size={ep_group.size()}, hidden_bytes={hidden_bytes})")
+
+        # This call triggers Buffer(group, nvl_bytes, rdma_bytes) which internally
+        # does nvshmem init — a collective across all EP group members.
+        # Since we call this outside the pipeline schedule, all ranks are synchronized.
+        get_buffer(ep_group, hidden_bytes)
+
+        dist.barrier()
+        logger.info(f"[DeepEP Warmup] DeepEP Buffer initialized successfully")
 
     @timer
     def sleep(self) -> None:
