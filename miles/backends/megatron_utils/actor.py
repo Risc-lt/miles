@@ -169,29 +169,101 @@ class MegatronTrainRayActor(TrainRayActor):
         return start_rollout_id
 
     def _warmup_nccl_communicators(self):
-        """Force eager NCCL communicator creation for PP P2P to avoid lazy init timeout."""
+        """Force eager NCCL communicator creation for PP P2P to avoid lazy init timeout.
+
+        Megatron's pipeline P2P uses three communication patterns that each create
+        separate NCCL sub-communicators under lazy initialization:
+        1. dist.send/recv on pp_group (unbatched P2P)
+        2. batch_isend_irecv on pp_group (batched P2P, used by _communicate_shapes)
+        3. dist.isend/irecv on WORLD group (used by _p2p_ops when pp_group.size()==2)
+
+        All three must be warmed up to avoid 600s timeout during the first forward pass.
+        """
         pp_size = mpu.get_pipeline_model_parallel_world_size()
         if pp_size <= 1:
             return
 
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         pp_group = mpu.get_pipeline_model_parallel_group()
+        prev_rank = mpu.get_pipeline_model_parallel_prev_rank()
+        next_rank = mpu.get_pipeline_model_parallel_next_rank()
 
         dummy = torch.zeros(1, device=torch.cuda.current_device())
 
-        # Forward direction warmup: each rank sends to next, receives from prev
+        # --- Pattern 1: unbatched dist.send/recv on pp_group ---
+        # Forward direction
         if pp_rank > 0:
-            dist.recv(dummy, src=mpu.get_pipeline_model_parallel_prev_rank(), group=pp_group)
+            dist.recv(dummy, src=prev_rank, group=pp_group)
         if pp_rank < pp_size - 1:
-            dist.send(dummy, dst=mpu.get_pipeline_model_parallel_next_rank(), group=pp_group)
-
-        # Backward direction warmup
+            dist.send(dummy, dst=next_rank, group=pp_group)
+        # Backward direction
         if pp_rank < pp_size - 1:
-            dist.recv(dummy, src=mpu.get_pipeline_model_parallel_next_rank(), group=pp_group)
+            dist.recv(dummy, src=next_rank, group=pp_group)
         if pp_rank > 0:
-            dist.send(dummy, dst=mpu.get_pipeline_model_parallel_prev_rank(), group=pp_group)
+            dist.send(dummy, dst=prev_rank, group=pp_group)
 
-        # Also warmup CP group if context_parallel_size > 1
+        # --- Pattern 2: batch_isend_irecv on pp_group ---
+        # This is what _communicate_shapes uses (variable_seq_lengths=True path).
+        # batch_isend_irecv creates different NCCL sub-communicators than send/recv.
+        dummy_shape = torch.zeros(3, device=torch.cuda.current_device(), dtype=torch.int64)
+
+        # Forward: recv from prev, send to next
+        ops = []
+        if pp_rank > 0:
+            ops.append(dist.P2POp(dist.irecv, dummy_shape.clone(), prev_rank, pp_group))
+        if pp_rank < pp_size - 1:
+            ops.append(dist.P2POp(dist.isend, dummy_shape.clone(), next_rank, pp_group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        torch.cuda.synchronize()
+
+        # Backward: recv from next, send to prev
+        ops = []
+        if pp_rank < pp_size - 1:
+            ops.append(dist.P2POp(dist.irecv, dummy_shape.clone(), next_rank, pp_group))
+        if pp_rank > 0:
+            ops.append(dist.P2POp(dist.isend, dummy_shape.clone(), prev_rank, pp_group))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        torch.cuda.synchronize()
+
+        # --- Pattern 3: isend/irecv on WORLD group ---
+        # _p2p_ops uses WORLD group when pp_group.size() == 2 for overlap.
+        # Even when pp_group.size() > 2, warm up WORLD group P2P as a safety measure
+        # since some code paths (e.g. _batched_p2p_ops -> recv on default_pg) may use it.
+        prev_global = dist.get_global_rank(pp_group, (pp_group.rank() - 1) % pp_group.size())
+        next_global = dist.get_global_rank(pp_group, (pp_group.rank() + 1) % pp_group.size())
+        dummy_world = torch.zeros(1, device=torch.cuda.current_device())
+
+        # Forward on WORLD
+        ops = []
+        if pp_rank > 0:
+            ops.append(dist.P2POp(dist.irecv, dummy_world.clone(), prev_global))
+        if pp_rank < pp_size - 1:
+            ops.append(dist.P2POp(dist.isend, dummy_world.clone(), next_global))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        torch.cuda.synchronize()
+
+        # Backward on WORLD
+        ops = []
+        if pp_rank < pp_size - 1:
+            ops.append(dist.P2POp(dist.irecv, dummy_world.clone(), next_global))
+        if pp_rank > 0:
+            ops.append(dist.P2POp(dist.isend, dummy_world.clone(), prev_global))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+        torch.cuda.synchronize()
+
+        # --- CP group warmup ---
         cp_size = mpu.get_context_parallel_world_size()
         if cp_size > 1:
             cp_group = mpu.get_context_parallel_group()
@@ -199,7 +271,8 @@ class MegatronTrainRayActor(TrainRayActor):
             dist.all_reduce(dummy_cp, group=cp_group)
 
         dist.barrier()
-        logger.info(f"[NCCL Warmup] PP={pp_size}, CP={cp_size} communicators warmed up")
+        logger.info(f"[NCCL Warmup] PP={pp_size}, CP={cp_size} communicators warmed up "
+                     f"(unbatched + batched P2P on pp_group + WORLD group)")
 
     @timer
     def sleep(self) -> None:
