@@ -62,6 +62,11 @@ def _warmup_pp_p2p_communicators():
     At 256-rank scale with PP=8, hundreds of simultaneous lazy inits create
     circular TCPStore dependencies → deadlock.
 
+    Critical: the miles megatron patch removes the `group` parameter from P2POp
+    in _batched_p2p_ops, so runtime PP P2P actually uses the DEFAULT (world)
+    process group via batch_isend_irecv, NOT the PP sub-group. The warm-up must
+    match this by using batch_isend_irecv with P2POp on the default group.
+
     This warm-up serializes the P2P comm creation by iterating through PP stage
     boundaries one at a time. For each boundary, all PP groups exercise their
     send/recv in parallel (safe — each pair uses a unique TCPStore key), then
@@ -78,22 +83,35 @@ def _warmup_pp_p2p_communicators():
     pp_group = mpu.get_pipeline_model_parallel_group()
     pp_group_ranks = dist.get_process_group_ranks(pp_group)
     device = torch.cuda.current_device()
-    dummy = torch.zeros(1, device=device)
 
-    # Warm up forward direction (stage i → stage i+1), one boundary at a time
+    # Warm up forward direction (stage i → stage i+1), one boundary at a time.
+    # Use batch_isend_irecv with P2POp (no group= arg) to match the patched
+    # Megatron _batched_p2p_ops which uses the default world PG.
     for stage in range(pp_size - 1):
+        ops = []
+        dummy = torch.zeros(1, device=device)
         if pp_rank == stage:
-            dist.send(dummy, dst=pp_group_ranks[stage + 1])
+            ops.append(dist.P2POp(dist.isend, dummy, pp_group_ranks[stage + 1]))
         elif pp_rank == stage + 1:
-            dist.recv(dummy, src=pp_group_ranks[stage])
+            ops.append(dist.P2POp(dist.irecv, dummy, pp_group_ranks[stage]))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
         dist.barrier(group=pp_group)
 
     # Warm up backward direction (stage i → stage i-1)
     for stage in range(pp_size - 1, 0, -1):
+        ops = []
+        dummy = torch.zeros(1, device=device)
         if pp_rank == stage:
-            dist.send(dummy, dst=pp_group_ranks[stage - 1])
+            ops.append(dist.P2POp(dist.isend, dummy, pp_group_ranks[stage - 1]))
         elif pp_rank == stage - 1:
-            dist.recv(dummy, src=pp_group_ranks[stage])
+            ops.append(dist.P2POp(dist.irecv, dummy, pp_group_ranks[stage]))
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
         dist.barrier(group=pp_group)
 
     logger.info(f"PP P2P communicator warm-up complete (pp_rank={pp_rank}/{pp_size})")
