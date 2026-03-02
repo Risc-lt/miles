@@ -301,12 +301,19 @@ class MegatronTrainRayActor(TrainRayActor):
         except ImportError:
             return
 
-        # Get the EP group used by the flex dispatcher (tp_ep_group)
+        # Get the TP_EP group that flex dispatcher actually uses for fused_dispatch.
+        # FlexMoETokenDispatcher passes pg_collection.tp_ep to _DeepepManager,
+        # which is get_expert_tensor_and_model_parallel_group().
+        # We MUST use the same group object here, otherwise get_buffer() will see
+        # _buffer.group != group and re-create the Buffer during forward.
         ep_group = None
         try:
-            ep_group = mpu.get_expert_model_parallel_group()
+            ep_group = mpu.get_expert_tensor_and_model_parallel_group()
         except Exception:
-            pass
+            try:
+                ep_group = mpu.get_expert_model_parallel_group()
+            except Exception:
+                pass
 
         if ep_group is None:
             return
