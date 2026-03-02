@@ -25,7 +25,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     train_tp: int = 8
     train_ep: int = 32
     train_pp: int = 8
-    train_cp: int = 4
+    train_cp: int = 2
     train_etp: int = 1
     # Rollout parallelism: 8 engines × 32 GPUs each (EP=32 for better expert locality)
     sglang_tp: int = 32  # NOTE: for sglang, moe_tp_size = tp_size // ep_size
