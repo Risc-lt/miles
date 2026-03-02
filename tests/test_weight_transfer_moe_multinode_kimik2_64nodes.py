@@ -287,6 +287,11 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
             "MILES_LOG_DIR": run_log_dir,
+            # NCCL debug for diagnosing P2P timeout issues
+            "NCCL_DEBUG": "WARN",
+            "NCCL_DEBUG_SUBSYS": "INIT,NET",
+            "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+            "NCCL_TIMEOUT": "1800000",  # 30 minutes in ms
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,
