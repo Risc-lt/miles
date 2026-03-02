@@ -300,10 +300,10 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         num_gpus=num_gpus,
     )
     if args.node_rank > 0 and args.wait_after:
-        if mode == "nccl":
-            time.sleep(800)
-        else:
-            time.sleep(3600)
+        # if mode == "nccl":
+        time.sleep(800)
+        # else:
+        #     time.sleep(7000)
 
 
 @U.dataclass_cli
