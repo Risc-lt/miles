@@ -240,9 +240,11 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--attention-softmax-in-fp32 "
         # K2 uses MLA (same as Qwen)
         "--attention-backend flash "
-        # K2-specific: enable DeepEP for training MoE
-        "--moe-enable-deepep "
-        "--moe-token-dispatcher-type flex "
+        # K2-specific: use alltoall dispatcher (instead of flex+deepep) to isolate
+        # DeepEP runtime all-to-all hang during pipeline forward
+        # "--moe-enable-deepep "
+        # "--moe-token-dispatcher-type flex "
+        "--moe-token-dispatcher-type alltoall "
         f"--actor-num-nodes {args.num_train_gpus // GPUS_PER_NODE} "
         f"--actor-num-gpus-per-node {GPUS_PER_NODE} "
         # 4GB buffer for weight update
