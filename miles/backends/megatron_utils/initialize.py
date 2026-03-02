@@ -53,6 +53,52 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
     )
 
 
+def _warmup_pp_p2p_communicators():
+    """
+    Warm up NCCL P2P sub-communicators between pipeline-parallel adjacent ranks.
+
+    In lazy NCCL mode, the first P2P send/recv between two ranks on the default
+    process group triggers creation of a 2-rank NCCL sub-communicator via TCPStore.
+    At 256-rank scale with PP=8, hundreds of simultaneous lazy inits create
+    circular TCPStore dependencies → deadlock.
+
+    This warm-up serializes the P2P comm creation by iterating through PP stage
+    boundaries one at a time. For each boundary, all PP groups exercise their
+    send/recv in parallel (safe — each pair uses a unique TCPStore key), then
+    barrier before moving to the next boundary.
+    """
+    import torch.distributed as dist
+
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+
+    if pp_size <= 1:
+        return
+
+    pp_group = mpu.get_pipeline_model_parallel_group()
+    pp_group_ranks = dist.get_process_group_ranks(pp_group)
+    device = torch.cuda.current_device()
+    dummy = torch.zeros(1, device=device)
+
+    # Warm up forward direction (stage i → stage i+1), one boundary at a time
+    for stage in range(pp_size - 1):
+        if pp_rank == stage:
+            dist.send(dummy, dst=pp_group_ranks[stage + 1])
+        elif pp_rank == stage + 1:
+            dist.recv(dummy, src=pp_group_ranks[stage])
+        dist.barrier(group=pp_group)
+
+    # Warm up backward direction (stage i → stage i-1)
+    for stage in range(pp_size - 1, 0, -1):
+        if pp_rank == stage:
+            dist.send(dummy, dst=pp_group_ranks[stage - 1])
+        elif pp_rank == stage - 1:
+            dist.recv(dummy, src=pp_group_ranks[stage])
+        dist.barrier(group=pp_group)
+
+    logger.info(f"PP P2P communicator warm-up complete (pp_rank={pp_rank}/{pp_size})")
+
+
 def init(args):
     set_args(args)
     if args.enable_experimental:
@@ -61,6 +107,7 @@ def init(args):
 
     # Pytorch distributed.
     _initialize_distributed(args)
+    _warmup_pp_p2p_communicators()
 
     # https://github.com/NVIDIA/Megatron-LM/issues/1563
     assert np.__version__.startswith("1."), "Megatron does not support numpy 2.x"
