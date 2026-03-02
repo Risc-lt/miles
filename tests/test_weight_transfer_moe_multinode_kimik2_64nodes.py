@@ -290,7 +290,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
             # NCCL debug for diagnosing P2P timeout issues
             "NCCL_DEBUG": "WARN",
             "NCCL_DEBUG_SUBSYS": "INIT,NET",
-            "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+            # "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
             "NCCL_TIMEOUT": "1800000",  # 30 minutes in ms
         },
         multinode=args.multinode,
