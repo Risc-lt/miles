@@ -292,6 +292,10 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
             "NCCL_DEBUG_SUBSYS": "INIT,NET",
             # "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
             "NCCL_TIMEOUT": "1800000",  # 30 minutes in ms
+            # NCCL Flight Recorder: dump debug info on timeout
+            "TORCH_NCCL_TRACE_BUFFER_SIZE": "2000",
+            "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
+            "TORCH_NCCL_TRACE_CPP_STACK": "1",
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,
