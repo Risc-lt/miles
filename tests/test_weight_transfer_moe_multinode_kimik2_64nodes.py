@@ -240,9 +240,11 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         "--attention-softmax-in-fp32 "
         # K2 uses MLA (same as Qwen)
         "--attention-backend flash "
-        # K2-specific: enable DeepEP for training MoE
-        "--moe-enable-deepep "
-        "--moe-token-dispatcher-type flex "
+        # K2-specific: use alltoall dispatcher (instead of flex+deepep) to isolate
+        # DeepEP runtime all-to-all hang during pipeline forward
+        # "--moe-enable-deepep "
+        # "--moe-token-dispatcher-type flex "
+        "--moe-token-dispatcher-type alltoall "
         f"--actor-num-nodes {args.num_train_gpus // GPUS_PER_NODE} "
         f"--actor-num-gpus-per-node {GPUS_PER_NODE} "
         # 4GB buffer for weight update
@@ -287,6 +289,11 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
                 "1" if args.enable_nccl_nvls else "0"
             ),  # Assuming NVLINK is available for multi-node setup
             "MILES_LOG_DIR": run_log_dir,
+            # # NCCL debug for diagnosing P2P timeout issues
+            # "NCCL_DEBUG": "WARN",
+            # "NCCL_DEBUG_SUBSYS": "INIT,NET",
+            # # "TORCH_DISTRIBUTED_DEBUG": "DETAIL",
+            # "NCCL_TIMEOUT": "1800000",  # 30 minutes in ms
         },
         multinode=args.multinode,
         is_head_node=args.node_rank == 0,
