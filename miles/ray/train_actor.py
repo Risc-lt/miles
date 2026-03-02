@@ -67,6 +67,7 @@ class TrainRayActor(RayActor):
         dist.init_process_group(
             backend=backend,
             timeout=timedelta(minutes=args.distributed_timeout_minutes),
+            device_id=torch.device(f"cuda:{local_rank}"),
         )
         init_gloo_group()
 
