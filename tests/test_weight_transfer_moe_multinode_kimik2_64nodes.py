@@ -74,9 +74,15 @@ def prepare(args: ScriptArgs):
         # U.exec_command(f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
-        # Force Warm
-        tokenizer = AutoTokenizer.from_pretrained(f"/root/models/{MODEL_NAME}/", trust_remote_code=True)
-        print("Tokenizer loaded, vocab size:", tokenizer.vocab_size)
+
+    # Warm-load tokenizer on EVERY node before Ray actors start.
+    # The Kimi-K2 tokenizer uses trust_remote_code=True which dynamically
+    # compiles tokenization_kimi.py into the HF cache. Without this, multiple
+    # Ray actor processes race to write the same cache files concurrently,
+    # causing sporadic "module has no attribute 'TikTokenTokenizer'" errors.
+    tokenizer = AutoTokenizer.from_pretrained(f"/root/models/{MODEL_NAME}/", trust_remote_code=True)
+    print(f"[Node {args.node_rank}] Tokenizer warm-loaded, vocab size: {tokenizer.vocab_size}")
+    del tokenizer
     # num_gpus = args.num_train_gpus + args.num_rollout_gpus
     # if not args.multinode:
     #     U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
