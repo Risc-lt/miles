@@ -1,7 +1,10 @@
 # TODO(jensen): may need to merge this file into the main test file in the future.
 from dataclasses import dataclass
 from typing import Literal
+
 import typer
+from transformers import AutoTokenizer
+
 import miles.utils.external_utils.command_utils as U
 from miles.utils.timer import log_experiment_start
 
@@ -66,28 +69,29 @@ class ScriptArgs(U.ExecuteTrainConfig):
 def prepare(args: ScriptArgs):
     if args.node_rank == 0:
         U.exec_command("mkdir -p /root/models /root/datasets")
-        U.exec_command(
-            f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}"
-        )
+        # U.exec_command(f"hf download moonshotai/Kimi-K2-Instruct --local-dir /root/models/{MODEL_NAME}")
         U.hf_download_dataset("zhuzilin/dapo-math-17k")
         U.hf_download_dataset("zhuzilin/aime-2024")
-    num_gpus = args.num_train_gpus + args.num_rollout_gpus
-    if not args.multinode:
-        U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
-    else:
-        # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
-        U.convert_checkpoint(
-            model_name=MODEL_NAME,
-            megatron_model_type=MODEL_TYPE,
-            num_gpus_per_node=GPUS_PER_NODE,
-            multinode=True,
-            master_addr=args.head_node_ip,
-            nnodes=args.nnodes,
-            dir_dst="/root/multinode",
-            node_rank=args.node_rank,
-            decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
-            extra_args=" --expert-model-parallel-size 8",
-        )
+    tokenizer = AutoTokenizer.from_pretrained(f"/root/models/{MODEL_NAME}/", trust_remote_code=True)
+    print("Tokenizer loaded, vocab size:", tokenizer.vocab_size)
+    # num_gpus = args.num_train_gpus + args.num_rollout_gpus
+    # if not args.multinode:
+    #     U.convert_checkpoint(model_name=MODEL_NAME, megatron_model_type=MODEL_TYPE, num_gpus_per_node=num_gpus)
+    # else:
+    #     # NOTE: currently when it comes to multinode case, all gpus of training/rollout should be multiple of GPUS_PER_NODE
+    #     U.convert_checkpoint(
+    #         model_name=MODEL_NAME,
+    #         megatron_model_type=MODEL_TYPE,
+    #         num_gpus_per_node=GPUS_PER_NODE,
+    #         multinode=True,
+    #         master_addr=args.head_node_ip,
+    #         nnodes=args.nnodes,
+    #         dir_dst="/root/multinode",
+    #         hf_checkpoint="/root/models/Kimi-K2-Instruct-bf16/",
+    #         node_rank=args.node_rank,
+    #         decoder_last_pipeline_num_layers=args.decoder_last_pipeline_num_layers,
+    #         extra_args=" --expert-model-parallel-size 8",
+    #     )
 
 
 def execute(args: ScriptArgs, mode: str, base_log_dir: str):
@@ -124,8 +128,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     if args.multinode:
         num_gpus_per_node = 8
         ckpt_args = (
-            f"--hf-checkpoint /root/models/{MODEL_NAME}/ "
-            f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
+            f"--hf-checkpoint /root/models/{MODEL_NAME}/ " f"--ref-load /root/multinode/{MODEL_NAME}_torch_dist/ "
         )
     else:
         num_gpus_per_node = args.num_train_gpus + args.num_rollout_gpus
@@ -203,7 +206,7 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
     sglang_args = (
         f"--rollout-num-gpus-per-engine {args.sglang_tp} "
         f"--rollout-num-gpus {args.num_rollout_gpus} "
-        "--sglang-mem-fraction-static 0.75 "
+        "--sglang-mem-fraction-static 0.7 "
         "--sglang-enable-dp-attention "
         f"--sglang-dp-size {args.sglang_dp} "
         f"--sglang-ep-size {args.sglang_ep} "
@@ -212,11 +215,16 @@ def execute(args: ScriptArgs, mode: str, base_log_dir: str):
         # K2-specific: dense TP size and server concurrency
         "--sglang-moe-dense-tp-size 1 "
         "--sglang-server-concurrency 1024 "
+        "--sglang-moe-runner-backend triton "
+        "--sglang-fp8-gemm-backend triton "
     )
     if is_rdma:
         sglang_args += "--sglang-remote-instance-weight-loader-start-seed-via-transfer-engine "
     if args.skip_validation:
         sglang_args += "--sglang-load-format dummy "
+    else:
+        sglang_args += """--sglang-model-loader-extra-config '{"enable_multithread_load": true, "num_threads": 8}' """
+
     if args.sglang_dp > 1:
         sglang_args += "--sglang-enable-dp-attention "
     mem = int(args.bucket_size * 1024 * 1024 * 1024)
