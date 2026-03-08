@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -D ./
-#SBATCH --job-name=rfork-8node-glm45-air
+#SBATCH --job-name=rocket-8nodes-val
 #SBATCH --output=output.%j.out
 #SBATCH --error=error.%j.err
 #SBATCH --time=72:00:00
@@ -79,7 +79,7 @@ setup_and_run() {
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
     git add -A && git stash
     git fetch jd --quiet
-    git reset --hard jd/remote-instance-loader-slime-integration
+    git reset --hard jd/remote-instance-loader-miles-integration
 
     cd /root/miles
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com

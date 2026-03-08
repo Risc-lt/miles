@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH -D ./
-#SBATCH --job-name=rfork-4node-test
+#SBATCH --job-name=rocket-4node-profile
 #SBATCH --output=output.%j.out
 #SBATCH --error=error.%j.err
 #SBATCH --time=72:00:00
@@ -77,7 +77,7 @@ setup_and_run() {
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
     git add -A && git stash
     git fetch jd --quiet
-    git reset --hard jd/remote-instance-loader-slime-integration
+    git reset --hard jd/remote-instance-loader-miles-integration
 
     cd /root/miles
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
@@ -101,7 +101,7 @@ setup_and_run() {
     # ---- run test ----
     echo "Starting test ... MILES_LOG_DIR=${MILES_LOG_DIR}"
     python /root/miles/tests/test_weight_transfer_moe_multinode.py \
-        --multinode --mode all \
+        --multinode --mode rmda-shared \
         --models glm45-air \
         --head-node-ip ${HEAD_NODE_IP} --nnodes ${NNODES} --node-rank ${NODE_RANK} \
         --enable-nccl-nvls --released-mc-transfer-timeout --wait-after \
