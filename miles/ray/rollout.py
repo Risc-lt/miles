@@ -523,36 +523,45 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             args=args, num_engines=num_engines, rollout_engines=rollout_engines
         )
 
-    # Determine if we should use seed-based loading:
-    # Active when engines load real weights (not dummy) AND transfer engine seed flag is set
-    # and there are multiple engines to benefit from seed loading.
-    # use_seed_loading = (
-    #     getattr(args, "sglang_load_format", None) != "dummy"
-    #     and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
-    #     and len(rollout_engines) > 1
-    # )
-    use_seed_loading = False
+    # Use seed loading if loading from file, and rdma registration available.
+    engine_nnodes = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
+    num_engines = len(rollout_engines) // engine_nnodes
+    use_seed_loading = (
+        getattr(args, "sglang_load_format", None) != "dummy"
+        and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
+        and num_engines > 1
+    )
 
     if use_seed_loading:
-        # Step 1: Init seed engine (rank 0) first — it loads from VAST (disk)
-        seed_rank, seed_engine = rollout_engines[0]
-        logger.info(f"Seed loading: initializing engine {seed_rank} as seed (loads from disk)")
-        ray.get(seed_engine.init.remote(**addr_and_ports[seed_rank]))
+        engine_groups = [
+            rollout_engines[i : i + engine_nnodes]
+            for i in range(0, len(rollout_engines), engine_nnodes)
+        ]
 
-        # Step 2: Init follower engines with remote_instance pointing to seed
-        seed_host = addr_and_ports[seed_rank]["host"]
-        seed_port = addr_and_ports[seed_rank]["port"]
+        # Step 1: Initialize the seed engine instance as usual. 
+        seed_group = engine_groups[0]
+        seed_head_rank = seed_group[0][0]
+        logger.info(
+            f"Seed loading: initializing seed engine (ranks {[r for r, _ in seed_group]}) "
+            f"with {engine_nnodes} node(s) — loads from disk"
+        )
+        seed_handles = [engine.init.remote(**addr_and_ports[rank]) for rank, engine in seed_group]
+        ray.get(seed_handles)
+
+        # Step 2: Init all follower engines with remote_instance pointing to seed.
+        seed_host = addr_and_ports[seed_head_rank]["host"]
+        seed_port = addr_and_ports[seed_head_rank]["port"]
 
         follower_handles = []
-        for rank, engine in rollout_engines[1:]:
-            addr_and_ports[rank]["seed_instance_ip"] = seed_host
-            addr_and_ports[rank]["seed_instance_service_port"] = seed_port
-            logger.info(f"Seed loading: engine {rank} will load from seed at {seed_host}:{seed_port}")
-            follower_handles.append(engine.init.remote(**addr_and_ports[rank]))
+        for group in engine_groups[1:]:
+            for rank, engine in group:
+                addr_and_ports[rank]["seed_instance_ip"] = seed_host
+                addr_and_ports[rank]["seed_instance_service_port"] = seed_port
+                logger.info(f"Seed loading: actor {rank} will load from seed at {seed_host}:{seed_port}")
+                follower_handles.append(engine.init.remote(**addr_and_ports[rank]))
 
         ray.get(follower_handles)
     else:
-        # Original path: all engines init in parallel
         init_handles = [engine.init.remote(**(addr_and_ports[rank])) for rank, engine in rollout_engines]
         ray.get(init_handles)
 
