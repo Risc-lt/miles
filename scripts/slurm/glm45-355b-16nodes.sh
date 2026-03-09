@@ -20,7 +20,7 @@ EXEC_DATE=$(date +%Y-%m-%d_%H-%M-%S)
 EXP="${EXP:-glm355b-standalone}"
 
 # --------------- container / image config ---------------
-IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/jiadongguo/docker_images/xinji1_miles.sqsh}"
+IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/xinji1/images/docker_images/radixark_miles_dev-20260305.sqsh}"
 container_mounts="/mnt/vast/checkpoints/jiadongguo/rdma:/data"
 
 # --------------- NCCL / UCX env vars ---------------
