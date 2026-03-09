@@ -76,7 +76,9 @@ setup_and_run() {
     git reset --hard jd/remote-instance-loader-miles-integration
 
     cd /root/miles
+    git remote add lt https://github.com/Risc-lt/miles.git 2>/dev/null || true
     git config user.name JD-ETH && git config user.email jaedon.guo@gmail.com
+    git add -A && git stash
     git fetch lt --quiet
     git reset --hard lt/jd/rdma-sharable-cpu-replica
 
