@@ -24,7 +24,7 @@ EXEC_DATE=$(date +%Y-%m-%d_%H-%M)
 EXP="${EXP:-rfork-engine-start}"
 
 # --------------- container / image config ---------------
-IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/xinji1/images/docker_images/radixark_miles_dev-20260305.sqsh}"
+IMAGE_PATH="${IMAGE_PATH:-/mnt/vast/checkpoints/xinji1/images/docker_images/miles-20260305.sqsh}"
 container_mounts="/mnt/vast/checkpoints/jiadongguo/rdma:/data"
 
 # --------------- NCCL / UCX env vars ---------------
