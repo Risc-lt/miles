@@ -525,25 +525,32 @@ def init_rollout_engines(args, pg, all_rollout_engines):
 
     # Use seed loading if loading from file, and rdma registration available.
     engine_nnodes = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
-    num_engines = len(rollout_engines) // engine_nnodes
     use_seed_loading = (
         getattr(args, "sglang_load_format", None) != "dummy"
         and getattr(args, "sglang_remote_instance_weight_loader_start_seed_via_transfer_engine", False)
-        and num_engines > 1
+        and len(rollout_engines) > engine_nnodes 
     )
 
     if use_seed_loading:
-        engine_groups = [
-            rollout_engines[i : i + engine_nnodes]
-            for i in range(0, len(rollout_engines), engine_nnodes)
-        ]
+        # Group Ray actors by logical engine using their ranks.
+        engine_groups = {}  # logical_engine_id -> [(rank, engine), ...]
+        for rank, engine in rollout_engines:
+            logical_engine_id = rank // engine_nnodes
+            engine_groups.setdefault(logical_engine_id, []).append((rank, engine))
 
-        # Step 1: Initialize the seed engine instance as usual. 
-        seed_group = engine_groups[0]
+        # The seed engine is the one with the lowest logical_engine_id
+        sorted_engine_ids = sorted(engine_groups.keys())
+        seed_engine_id = sorted_engine_ids[0]
+        seed_group = engine_groups[seed_engine_id]
+
+        assert len(seed_group) == engine_nnodes, f"Seed loading: seed engine group {seed_engine_id} has {len(seed_group)} "
+
+        # Step 1: Init ALL nodes of the seed engine together.
         seed_head_rank = seed_group[0][0]
         logger.info(
-            f"Seed loading: initializing seed engine (ranks {[r for r, _ in seed_group]}) "
-            f"with {engine_nnodes} node(s) — loads from disk"
+            f"Seed loading: initializing seed engine {seed_engine_id} "
+            f"(ranks {[r for r, _ in seed_group]}) with {engine_nnodes} node(s) "
+            f"— loads from disk"
         )
         seed_handles = [engine.init.remote(**addr_and_ports[rank]) for rank, engine in seed_group]
         ray.get(seed_handles)
@@ -551,9 +558,9 @@ def init_rollout_engines(args, pg, all_rollout_engines):
         # Step 2: Init all follower engines with remote_instance pointing to seed.
         seed_host = addr_and_ports[seed_head_rank]["host"]
         seed_port = addr_and_ports[seed_head_rank]["port"]
-
         follower_handles = []
-        for group in engine_groups[1:]:
+        for eid in sorted_engine_ids[1:]:
+            group = engine_groups[eid]
             for rank, engine in group:
                 addr_and_ports[rank]["seed_instance_ip"] = seed_host
                 addr_and_ports[rank]["seed_instance_service_port"] = seed_port
